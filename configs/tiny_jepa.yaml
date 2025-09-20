@@ -1,0 +1,44 @@
+seed_everything: 1337
+
+trainer:
+  max_steps: 3000
+  log_every_n_steps: 25
+  val_check_interval: 500
+  check_val_every_n_epoch: null  # allow val_check_interval to be interpreted globally across steps
+  gradient_clip_val: 1.0
+  precision: 32
+  accelerator: auto
+  devices: auto
+
+model:
+  vocab_size: 1000     # can be left as-is; tokenizer ids are <= vocab_size
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  dropout: 0.1
+  ff_multiplier: 4
+  use_rope: true
+  rope_base: 10000
+  jepa:
+    latent_dim: 256
+    predictor_hidden_multiplier: 2
+    horizons: [8, 32, 128]
+    horizon_probs: [0.5, 0.3, 0.2]
+    pairs_per_seq: 64
+    ema_momentum: 0.996
+    gamma_var: 1.0
+    gamma_cov: 1.0
+    lambda_weight: 0.1  # balance between LM and JEPA
+
+  optimizer:
+    lr: 3.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 200
+
+data:
+  data_dir: data/
+  block_size: 512
+  batch_size: 32
+  num_workers: 2
+  download_url: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt

@@ -1,0 +1,107 @@
+from typing import Optional, List
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .norms import RMSNorm
+from .rope import build_rope_cache, apply_rope
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        inner = hidden_mult * d_model
+        self.w1 = nn.Linear(d_model, inner, bias=False)
+        self.w2 = nn.Linear(d_model, inner, bias=False)
+        self.w3 = nn.Linear(inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        a = self.w1(x)
+        b = self.w2(x)
+        x = F.silu(a) * b
+        x = self.w3(x)
+        return self.dropout(x)
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, use_rope: bool = True, rope_base: float = 10000.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.use_rope = use_rope
+        self.rope_base = rope_base
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        self._rope_cache = None
+        self._rope_cache_len = 0
+
+    def maybe_build_rope(self, seq_len, device, dtype):
+        if not self.use_rope:
+            return None
+        if self._rope_cache is None or self._rope_cache_len < seq_len or self._rope_cache[0].device != device:
+            cos, sin = build_rope_cache(seq_len, self.head_dim, base=self.rope_base, device=device, dtype=dtype)
+            self._rope_cache = (cos, sin)
+            self._rope_cache_len = seq_len
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, D)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if self.use_rope:
+            self.maybe_build_rope(T, x.device, x.dtype)
+            cos, sin = self._rope_cache
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
+        # scaled dot-product attention with causal masking
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.dropout.p if self.training else 0.0, is_causal=True
+        )  # (B, H, T, D)
+        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
+        return self.o_proj(attn)
+
+class DecoderBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
+                 ff_multiplier: int = 4, use_rope: bool = True, rope_base: float = 10000.0):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout, use_rope, rope_base)
+        self.norm2 = RMSNorm(d_model)
+        self.ff = SwiGLU(d_model, hidden_mult=ff_multiplier, dropout=dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
+
+class DecoderOnlyTransformer(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
+                 dropout: float = 0.1, ff_multiplier: int = 4, use_rope: bool = True, rope_base: float = 10000.0):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList([
+            DecoderBlock(d_model, n_heads, dropout, ff_multiplier, use_rope, rope_base)
+            for _ in range(n_layers)
+        ])
+        self.norm_f = RMSNorm(d_model)
+
+        # LM head with weight tying
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight  # tie weights
+
+    def forward(self, idx):
+        # idx: (B, T) token ids
+        x = self.token_emb(idx)  # (B, T, C)
+        x = self.drop(x)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm_f(x)
+        return x  # final hidden states (B, T, C)

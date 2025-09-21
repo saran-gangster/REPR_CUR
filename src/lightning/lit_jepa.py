@@ -98,6 +98,21 @@ class LitJEPA(L.LightningModule):
             jepa_out = self.jepa(h)
             total_loss = lm_loss + self.lambda_weight * jepa_out["loss"]
 
+            # Imposter validation
+            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h)
+            p = F.normalize(z_pred, dim=-1)
+            y = F.normalize(z_tgt, dim=-1)
+            d_true_all = 1.0 - (p * y).sum(dim=-1)  # (N,)
+
+            # "Imposter" targets: roll by 1 (alternative: random permutation)
+            y_imp = torch.roll(y, shifts=1, dims=0)
+            d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
+
+            dist_true = d_true_all.mean()
+            dist_imposter = d_imp_all.mean()
+            imposter_acc = (d_true_all < d_imp_all).float().mean()
+
+        # Existing logs
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True)
         self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True)
@@ -105,9 +120,39 @@ class LitJEPA(L.LightningModule):
         self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True)
         self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True)
 
+        # New logs
+        self.log("val/imposter_acc", imposter_acc, on_epoch=True)
+        self.log("val/dist_true", dist_true, on_epoch=True)
+        self.log("val/dist_imposter", dist_imposter, on_epoch=True)
+        # Optional: LM perplexity for interpretability
+        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True)
+
+        # Per-horizon breakdown (diagnostics)
+        with torch.no_grad():
+            for hid, horizon in enumerate(self.jepa.horizons):
+                mask = (k_ids == hid)
+                if mask.any():
+                    acc_h = (d_true_all[mask] < d_imp_all[mask]).float().mean()
+                    self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True)
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA update after optimizer step
         self.jepa.momentum_update()
+
+    def on_fit_start(self):
+        # If WandbLogger is active, watch the model to log gradients/params
+        try:
+            from lightning.pytorch.loggers import WandbLogger
+            from lightning.pytorch.loggers.logger import LoggerCollection
+        except Exception:
+            return
+        logger = self.logger
+        if isinstance(logger, LoggerCollection):
+            for lg in logger:
+                if isinstance(lg, WandbLogger):
+                    lg.watch(self, log="gradients", log_freq=200)
+        elif isinstance(logger, WandbLogger):
+            logger.watch(self, log="gradients", log_freq=200)
 
     def configure_optimizers(self):
         wd = self.optim_cfg.get("weight_decay", 0.1)

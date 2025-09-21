@@ -10,6 +10,20 @@ trainer:
   accelerator: auto
   devices: auto
 
+  # Log to both TensorBoard and Weights & Biases
+  logger:
+    - class_path: lightning.pytorch.loggers.tensorboard.TensorBoardLogger
+      init_args:
+        save_dir: lightning_logs
+        name: tb
+    - class_path: lightning.pytorch.loggers.wandb.WandbLogger
+      init_args:
+        project: unified-exit-jepa
+        name: tiny-jepa
+        save_dir: wandb_logs
+        log_model: false
+        tags: ["tinyshakespeare", "jepa", "byol", "prototype"]
+
 model:
   vocab_size: 1000     # can be left as-is; tokenizer ids are <= vocab_size
   d_model: 256

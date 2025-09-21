@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, List
+from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,26 +44,41 @@ class JEPAObjective(nn.Module):
         self.gamma_var = gamma_var
         self.gamma_cov = gamma_cov
 
-        self.horizon_emb = nn.Embedding(len(horizons), d_model)
-        self.predictor = MLP(in_dim=d_model * 2, out_dim=latent_dim,
-                             hidden_mult=predictor_hidden_multiplier, dropout=dropout)
-        # target projector is EMA copy recipient
+        # Horizon embedding directly in latent space
+        self.horizon_emb_latent = nn.Embedding(len(horizons), latent_dim)
+
+        # BYOL-correct: online and target projectors share architecture
+        self.online_proj = MLP(in_dim=d_model, out_dim=latent_dim,
+                               hidden_mult=predictor_hidden_multiplier, dropout=dropout)
         self.target_proj = MLP(in_dim=d_model, out_dim=latent_dim,
                                hidden_mult=predictor_hidden_multiplier, dropout=0.0)
-        self._init_target_from_predictor()
 
-    def _init_target_from_predictor(self):
-        # initialize target_proj to same structure (but from predictor's "output space")
-        # We only copy shapes that match
+        # Predictor operates purely in latent space over [z_anchor, z_k]
+        self.predictor = MLP(in_dim=2 * latent_dim, out_dim=latent_dim,
+                             hidden_mult=predictor_hidden_multiplier, dropout=dropout)
+
+        self._init_target_from_online()
+
+    def _init_target_from_online(self):
         with torch.no_grad():
-            for tp, pp in zip(self.target_proj.parameters(), self.predictor.parameters()):
-                if tp.shape == pp.shape:
-                    tp.data.copy_(pp.data)
+            for tp, op in zip(self.target_proj.parameters(), self.online_proj.parameters()):
+                if tp.shape == op.shape:
+                    tp.data.copy_(op.data)
 
     @torch.no_grad()
     def momentum_update(self):
-        # EMA update for target projector
-        update_ema_(self.target_proj, self.predictor, self.ema_momentum)
+        # EMA update for target projector from online projector
+        update_ema_(self.target_proj, self.online_proj, self.ema_momentum)
+
+    def _sample_pairs(self, B: int, T: int, device):
+        return sample_anchor_target_pairs(
+            batch_size=B,
+            seq_len=T,
+            pairs_per_seq=self.pairs_per_seq,
+            horizon_values=self.horizons,
+            horizon_probs=self.horizon_probs,
+            device=device
+        )
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -74,33 +89,29 @@ class JEPAObjective(nn.Module):
         device = h.device
 
         # sample anchor/target pairs
-        (b_idx, t_idx, tpos, k_ids) = sample_anchor_target_pairs(
-            batch_size=B,
-            seq_len=T,
-            pairs_per_seq=self.pairs_per_seq,
-            horizon_values=self.horizons,
-            horizon_probs=self.horizon_probs,
-            device=device
-        )
+        b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+
         # gather hidden states
         h_anchor = h[b_idx, t_idx, :]           # (N, C)
         h_target = h[b_idx, tpos, :]            # (N, C)
-        # horizon embeddings
-        hk = self.horizon_emb(k_ids)            # (N, C)
-        predictor_in = torch.cat([h_anchor, hk], dim=-1)    # (N, 2C)
-        z_pred = self.predictor(predictor_in)   # (N, D_latent)
 
-        with torch.no_grad():
-            z_tgt = self.target_proj(h_target)  # (N, D_latent)
-            z_tgt = z_tgt.detach()
+        # project to latent space
+        z_anchor = self.online_proj(h_anchor)   # (N, D_latent)
+        z_tgt = self.target_proj(h_target).detach()  # (N, D_latent)
 
-        # cosine distance
+        # horizon embedding in latent space
+        z_k = self.horizon_emb_latent(k_ids)    # (N, D_latent)
+
+        # predictor in latent space
+        z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D_latent)
+
+        # cosine loss
         p = F.normalize(z_pred, dim=-1)
         y = F.normalize(z_tgt, dim=-1)
         cos_loss = 1.0 - (p * y).sum(dim=-1)
         cos_loss = cos_loss.mean()
 
-        # VICReg-style variance and covariance terms (to prevent collapse)
+        # VICReg terms (on unnormalized latents)
         var_loss = variance_loss(z_pred) + variance_loss(z_tgt)
         cov_loss = covariance_loss(z_pred) + covariance_loss(z_tgt)
 
@@ -111,5 +122,29 @@ class JEPAObjective(nn.Module):
             "cos_loss": cos_loss.detach(),
             "var_loss": var_loss.detach(),
             "cov_loss": cov_loss.detach(),
-            "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float)
+            "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float),
         }
+
+    @torch.no_grad()
+    def compute_latents(self, h: torch.Tensor):
+        """
+        Utility for validation: sample pairs and return prediction/target latents.
+        Returns:
+          z_pred: (N, D)
+          z_tgt:  (N, D)
+          k_ids:  (N,) horizon category ids
+        """
+        B, T, C = h.shape
+        device = h.device
+
+        b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+
+        h_anchor = h[b_idx, t_idx, :]    # (N, C)
+        h_target = h[b_idx, tpos, :]     # (N, C)
+
+        z_anchor = self.online_proj(h_anchor)       # (N, D)
+        z_k = self.horizon_emb_latent(k_ids)        # (N, D)
+        z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D)
+        z_tgt = self.target_proj(h_target)          # (N, D)
+
+        return z_pred, z_tgt, k_ids

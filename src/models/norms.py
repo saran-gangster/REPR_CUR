@@ -9,6 +9,6 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         # x: (..., dim)
-        norm = x.norm(dim=-1, keepdim=True) * (1.0 / (x.shape[-1] ** 0.5))
-        x_normed = x / (norm + self.eps)
-        return self.weight * x_normed
+        # Efficient RMSNorm: x * rsqrt(mean(x^2) + eps)
+        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * inv_rms * self.weight

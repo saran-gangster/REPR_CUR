@@ -1,6 +1,4 @@
 import os
-import json
-import math
 import requests
 from typing import Optional
 import numpy as np
@@ -77,9 +75,25 @@ class TinyShakespeareDataModule(L.LightningDataModule):
         self.val_ds = CharDataset(self.val_data, self.block_size)
 
     def train_dataloader(self):
-        return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
-                          num_workers=self.num_workers, drop_last=True, pin_memory=True)
+        kwargs = dict(
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            drop_last=True,
+            pin_memory=torch.cuda.is_available(),
+        )
+        if self.num_workers > 0:
+            kwargs.update(persistent_workers=True, prefetch_factor=4)
+        return DataLoader(self.train_ds, **kwargs)
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, drop_last=True, pin_memory=True)
+        kwargs = dict(
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            drop_last=True,
+            pin_memory=torch.cuda.is_available(),
+        )
+        if self.num_workers > 0:
+            kwargs.update(persistent_workers=True, prefetch_factor=4)
+        return DataLoader(self.val_ds, **kwargs)

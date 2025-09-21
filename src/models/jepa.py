@@ -36,13 +36,17 @@ class JEPAObjective(nn.Module):
     ):
         super().__init__()
         assert len(horizons) == len(horizon_probs)
-        self.horizons = horizons
-        self.horizon_probs = torch.tensor(horizon_probs, dtype=torch.float)
-        self.horizon_probs = self.horizon_probs / self.horizon_probs.sum()
         self.pairs_per_seq = pairs_per_seq
         self.ema_momentum = ema_momentum
         self.gamma_var = gamma_var
         self.gamma_cov = gamma_cov
+
+        # Register sampling buffers to avoid per-step device transfers/allocations
+        probs = torch.tensor(horizon_probs, dtype=torch.float)
+        probs = probs / probs.sum()
+        self.register_buffer("horizon_probs", probs)
+        self.register_buffer("horizon_values", torch.tensor(horizons, dtype=torch.long))
+        self.horizons = horizons  # keep for logging
 
         # Horizon embedding directly in latent space
         self.horizon_emb_latent = nn.Embedding(len(horizons), latent_dim)
@@ -75,7 +79,7 @@ class JEPAObjective(nn.Module):
             batch_size=B,
             seq_len=T,
             pairs_per_seq=self.pairs_per_seq,
-            horizon_values=self.horizons,
+            horizon_values=self.horizon_values,
             horizon_probs=self.horizon_probs,
             device=device
         )

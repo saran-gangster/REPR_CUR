@@ -9,15 +9,14 @@ class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         inner = hidden_mult * d_model
-        self.w1 = nn.Linear(d_model, inner, bias=False)
-        self.w2 = nn.Linear(d_model, inner, bias=False)
+        # Fuse two projections into one matmul for speed
+        self.w12 = nn.Linear(d_model, 2 * inner, bias=False)
         self.w3 = nn.Linear(inner, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        a = self.w1(x)
-        b = self.w2(x)
-        x = F.silu(a) * b
+        u, v = self.w12(x).chunk(2, dim=-1)
+        x = F.silu(u) * v
         x = self.w3(x)
         return self.dropout(x)
 
@@ -31,9 +30,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.use_rope = use_rope
         self.rope_base = rope_base
 
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        # Fuse QKV into a single projection for speed
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
@@ -43,16 +41,22 @@ class MultiHeadSelfAttention(nn.Module):
     def maybe_build_rope(self, seq_len, device, dtype):
         if not self.use_rope:
             return None
-        if self._rope_cache is None or self._rope_cache_len < seq_len or self._rope_cache[0].device != device:
+        if (
+            self._rope_cache is None
+            or self._rope_cache_len < seq_len
+            or self._rope_cache[0].device != device
+            or self._rope_cache[0].dtype != dtype
+        ):
             cos, sin = build_rope_cache(seq_len, self.head_dim, base=self.rope_base, device=device, dtype=dtype)
             self._rope_cache = (cos, sin)
             self._rope_cache_len = seq_len
 
     def forward(self, x):
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, D)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        qkv = self.qkv_proj(x)  # (B, T, 3*C)
+        qkv = qkv.view(B, T, 3, self.n_heads, self.head_dim).permute(0, 2, 3, 1, 4)  # (B, 3, H, T, D)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each (B, H, T, D)
 
         if self.use_rope:
             self.maybe_build_rope(T, x.device, x.dtype)

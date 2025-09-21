@@ -1,4 +1,7 @@
 from typing import Any, Dict
+import os
+import math
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,7 +22,7 @@ class WarmupCosineLR(optim.lr_scheduler._LRScheduler):
             scale = float(step) / max(1, self.warmup_steps)
         else:
             progress = float(step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-            scale = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.1415926535))).item()
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
         return [base_lr * scale for base_lr in self.base_lrs]
 
 class LitJEPA(L.LightningModule):
@@ -136,10 +139,19 @@ class LitJEPA(L.LightningModule):
                     self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # EMA update after optimizer step
+        # EMA update after optimizer step would be ideal; keeping here to avoid hook order changes.
         self.jepa.momentum_update()
 
     def on_fit_start(self):
+        # Enable TF32 on Ampere+ GPUs for additional speed
+        if torch.cuda.is_available():
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
         # If WandbLogger is active, watch the model to log gradients/params
         try:
             from lightning.pytorch.loggers import WandbLogger
@@ -154,13 +166,33 @@ class LitJEPA(L.LightningModule):
         elif isinstance(logger, WandbLogger):
             logger.watch(self, log="gradients", log_freq=200)
 
+    def setup(self, stage: str):
+        # Optional compilation for extra speed on CUDA: export TORCH_COMPILE=1
+        if hasattr(torch, "compile") and os.getenv("TORCH_COMPILE", "0") == "1":
+            if torch.cuda.is_available():
+                mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
+                try:
+                    self.model = torch.compile(self.model, mode=mode)
+                except Exception:
+                    # Fallback silently if compilation is not supported
+                    pass
+
     def configure_optimizers(self):
         wd = self.optim_cfg.get("weight_decay", 0.1)
         betas = self.optim_cfg.get("betas", (0.9, 0.95))
         lr = self.optim_cfg.get("lr", 3e-4)
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
-        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=wd)
+        AdamW = torch.optim.AdamW
+        optimizer = None
+        try:
+            # Use fused AdamW on CUDA if available
+            if "fused" in inspect.signature(AdamW).parameters and torch.cuda.is_available():
+                optimizer = AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=wd, fused=True)
+        except Exception:
+            optimizer = None
+        if optimizer is None:
+            optimizer = AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=wd)
 
         if self.trainer.max_steps is None:
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)

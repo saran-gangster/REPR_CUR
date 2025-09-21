@@ -21,14 +21,15 @@ model:
   rope_base: 10000
   jepa:
     latent_dim: 256
-    predictor_hidden_multiplier: 2
+    predictor_hidden_multiplier: 1.5
     horizons: [8, 32, 128]
     horizon_probs: [0.5, 0.3, 0.2]
     pairs_per_seq: 64
-    ema_momentum: 0.998
-    gamma_var: 25.0
-    gamma_cov: 25.0
-    lambda_weight: 0.1
+    ema_momentum: 0.995
+    gamma_var: 1.0
+    gamma_cov: 1.0
+    lambda_weight: 0.5
+    tau: 0.2
 
   optimizer:
     lr: 3.0e-4

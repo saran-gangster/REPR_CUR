@@ -7,9 +7,9 @@ from src.utils.vicreg import variance_loss, covariance_loss
 from src.utils.ema import update_ema_
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_mult: int = 2, dropout: float = 0.0):
+    def __init__(self, in_dim: int, out_dim: int, hidden_mult: float = 2.0, dropout: float = 0.0):
         super().__init__()
-        hidden = hidden_mult * out_dim
+        hidden = int(round(hidden_mult * out_dim))
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden, bias=True),
             nn.GELU(),
@@ -25,7 +25,7 @@ class JEPAObjective(nn.Module):
         self,
         d_model: int,
         latent_dim: int = 256,
-        predictor_hidden_multiplier: int = 2,
+        predictor_hidden_multiplier: float = 2.0,
         horizons: List[int] = [8, 32, 128],
         horizon_probs: List[float] = [0.5, 0.3, 0.2],
         pairs_per_seq: int = 64,
@@ -33,6 +33,7 @@ class JEPAObjective(nn.Module):
         gamma_var: float = 1.0,
         gamma_cov: float = 1.0,
         dropout: float = 0.0,
+        tau: float = 0.2,
     ):
         super().__init__()
         assert len(horizons) == len(horizon_probs)
@@ -40,6 +41,7 @@ class JEPAObjective(nn.Module):
         self.ema_momentum = ema_momentum
         self.gamma_var = gamma_var
         self.gamma_cov = gamma_cov
+        self.tau = tau
 
         # Register sampling buffers to avoid per-step device transfers/allocations
         probs = torch.tensor(horizon_probs, dtype=torch.float)
@@ -101,7 +103,7 @@ class JEPAObjective(nn.Module):
 
         # project to latent space
         z_anchor = self.online_proj(h_anchor)   # (N, D_latent)
-        z_tgt = self.target_proj(h_target).detach()  # (N, D_latent)
+        z_tgt = self.target_proj(h_target).detach()  # (N, D_latent), stop-grad teacher
 
         # horizon embedding in latent space
         z_k = self.horizon_emb_latent(k_ids)    # (N, D_latent)
@@ -109,23 +111,46 @@ class JEPAObjective(nn.Module):
         # predictor in latent space
         z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D_latent)
 
-        # cosine loss
+        # normalize for similarity
         p = F.normalize(z_pred, dim=-1)
         y = F.normalize(z_tgt, dim=-1)
+
+        # InfoNCE per-horizon (in-batch negatives within each horizon bucket)
+        tau = self.tau
+        unique_hids = torch.unique(k_ids)
+        total_n = p.size(0)
+        info_loss = torch.zeros((), device=device)
+        for hid in unique_hids:
+            idx = (k_ids == hid).nonzero(as_tuple=True)[0]
+            n = idx.numel()
+            if n == 0:
+                continue
+            sim = (p[idx] @ y[idx].T) / tau  # (n, n)
+            target = torch.arange(n, device=device)
+            loss_h = F.cross_entropy(sim, target)
+            info_loss = info_loss + loss_h * (n / max(1, total_n))
+        # cosine diagnostic (not used for optimization)
         cos_loss = 1.0 - (p * y).sum(dim=-1)
         cos_loss = cos_loss.mean()
 
-        # VICReg terms (on unnormalized latents)
-        var_loss = variance_loss(z_pred) + variance_loss(z_tgt)
-        cov_loss = covariance_loss(z_pred) + covariance_loss(z_tgt)
+        # VICReg-style regularization only on online branch
+        var_loss = variance_loss(z_pred)
+        cov_loss = covariance_loss(z_pred)
 
-        loss = cos_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
+        loss = info_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
+
+        # diagnostics: std of teacher and online latents
+        std_tgt = z_tgt.std(dim=0, unbiased=False).mean()
+        std_pred = z_pred.std(dim=0, unbiased=False).mean()
 
         return {
             "loss": loss,
+            "info_nce_loss": info_loss.detach(),
             "cos_loss": cos_loss.detach(),
             "var_loss": var_loss.detach(),
             "cov_loss": cov_loss.detach(),
+            "std_tgt": std_tgt.detach(),
+            "std_pred": std_pred.detach(),
             "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float),
         }
 

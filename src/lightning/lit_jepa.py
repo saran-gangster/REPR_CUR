@@ -49,7 +49,7 @@ class LitJEPA(L.LightningModule):
         self.jepa = JEPAObjective(
             d_model=d_model,
             latent_dim=jepa_cfg.get("latent_dim", d_model),
-            predictor_hidden_multiplier=jepa_cfg.get("predictor_hidden_multiplier", 2),
+            predictor_hidden_multiplier=jepa_cfg.get("predictor_hidden_multiplier", 2.0),
             horizons=jepa_cfg.get("horizons", [8, 32, 128]),
             horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.3, 0.2]),
             pairs_per_seq=jepa_cfg.get("pairs_per_seq", 64),
@@ -57,6 +57,7 @@ class LitJEPA(L.LightningModule):
             gamma_var=jepa_cfg.get("gamma_var", 1.0),
             gamma_cov=jepa_cfg.get("gamma_cov", 1.0),
             dropout=dropout,
+            tau=jepa_cfg.get("tau", 0.2),
         )
         self.lambda_weight = jepa_cfg.get("lambda_weight", 0.1)
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
@@ -87,9 +88,11 @@ class LitJEPA(L.LightningModule):
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=False)
         self.log("train/lm_loss", lm_loss, on_step=True)
         self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
+        self.log("train/info_nce_loss", jepa_out["info_nce_loss"], on_step=True)
         self.log("train/cos_loss", jepa_out["cos_loss"], on_step=True)
         self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
         self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
+        self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
         self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
         return total_loss
 
@@ -119,9 +122,11 @@ class LitJEPA(L.LightningModule):
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True)
         self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True)
+        self.log("val/info_nce_loss", jepa_out["info_nce_loss"], on_epoch=True)
         self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True)
         self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True)
         self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True)
+        self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True)
 
         # New logs
         self.log("val/imposter_acc", imposter_acc, on_epoch=True)

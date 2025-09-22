@@ -20,6 +20,7 @@ model:
   use_rope: true
   rope_base: 10000
   jepa:
+    # JEPA objective + weighting
     latent_dim: 256
     predictor_hidden_multiplier: 1.5
     horizons: [8, 32, 128]
@@ -28,8 +29,11 @@ model:
     ema_momentum: 0.995
     gamma_var: 1.0
     gamma_cov: 1.0
-    lambda_weight: 0.5
     tau: 0.2
+    # Loss weights (new). Back-compat: if jepa_weight not set, lambda_weight is used.
+    jepa_weight: 1.0
+    lm_weight: 0.0
+    # lambda_weight: 0.5  # legacy key, ignored if jepa_weight is present
 
   optimizer:
     lr: 3.0e-4
@@ -43,3 +47,10 @@ data:
   batch_size: 32
   num_workers: 2
   download_url: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+
+  # New: tokenizer + synthetic controls for Run 4.x
+  tokenizer_type: char   # options: char | byte | tiktoken
+  use_synthetic: false   # set true for Run 4.2
+  synthetic_vocab_size: 16
+  synthetic_segment_len: 192
+  synthetic_num_segments: 3

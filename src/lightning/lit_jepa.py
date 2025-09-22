@@ -59,7 +59,10 @@ class LitJEPA(L.LightningModule):
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
         )
-        self.lambda_weight = jepa_cfg.get("lambda_weight", 0.1)
+        # New: independent weights (back-compat with lambda_weight)
+        self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
+        self.lm_weight = jepa_cfg.get("lm_weight", 1.0)
+
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
 
     def forward(self, x):
@@ -80,19 +83,24 @@ class LitJEPA(L.LightningModule):
         h = self(x)
 
         # Losses
-        lm_loss = self._lm_loss(h, x)
+        if self.lm_weight > 0.0:
+            lm_loss = self._lm_loss(h, x)
+        else:
+            lm_loss = torch.tensor(0.0, device=self.device)
+
         jepa_out = self.jepa(h)
-        total_loss = lm_loss + self.lambda_weight * jepa_out["loss"]
+        total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
 
         # Logging
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=False)
         self.log("train/lm_loss", lm_loss, on_step=True)
         self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
-        self.log("train/info_nce_loss", jepa_out["info_nce_loss"], on_step=True)
+        self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_step=True)
         self.log("train/cos_loss", jepa_out["cos_loss"], on_step=True)
         self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
         self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
         self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
+        self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
         self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
         return total_loss
 
@@ -100,9 +108,13 @@ class LitJEPA(L.LightningModule):
         x = batch
         with torch.no_grad():
             h = self(x)
-            lm_loss = self._lm_loss(h, x)
+            if self.lm_weight > 0.0:
+                lm_loss = self._lm_loss(h, x)
+            else:
+                lm_loss = torch.tensor(0.0, device=self.device)
+
             jepa_out = self.jepa(h)
-            total_loss = lm_loss + self.lambda_weight * jepa_out["loss"]
+            total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
 
             # Imposter validation
             z_pred, z_tgt, k_ids = self.jepa.compute_latents(h)
@@ -122,7 +134,7 @@ class LitJEPA(L.LightningModule):
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
         self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
-        self.log("val/info_nce_loss", jepa_out["info_nce_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
         self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
         self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
         self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
@@ -133,8 +145,8 @@ class LitJEPA(L.LightningModule):
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
-        # Optional: LM perplexity for interpretability
-        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
+        if self.lm_weight > 0.0:
+            self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
         # Per-horizon breakdown (diagnostics)
         with torch.no_grad():
@@ -145,10 +157,29 @@ class LitJEPA(L.LightningModule):
                     self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # EMA update after optimizer step would be ideal; keeping here to avoid hook order changes.
         self.jepa.momentum_update()
 
     def on_fit_start(self):
+        # match vocab to datamodule automatically (so BPE/synthetic "just work")
+        try:
+            dm = self.trainer.datamodule
+            if dm is not None and getattr(dm, "vocab_size", None):
+                new_V = int(dm.vocab_size)
+                # The model has an LM head even if LM loss is off; tie to token_emb.
+                old_V = self.model.lm_head.out_features
+                if new_V != old_V:
+                    d_model = self.model.token_emb.embedding_dim
+                    device = self.device
+                    tok = nn.Embedding(new_V, d_model).to(device)
+                    self.model.token_emb = tok
+                    head = nn.Linear(d_model, new_V, bias=False).to(device)
+                    head.weight = self.model.token_emb.weight  # tie weights
+                    self.model.lm_head = head
+                    # Update saved hyperparams for clarity
+                    self.hparams.vocab_size = new_V
+        except Exception:
+            pass
+
         # Enable TF32 on Ampere+ GPUs for additional speed
         if torch.cuda.is_available():
             try:
@@ -180,7 +211,6 @@ class LitJEPA(L.LightningModule):
                 try:
                     self.model = torch.compile(self.model, mode=mode)
                 except Exception:
-                    # Fallback silently if compilation is not supported
                     pass
 
     def configure_optimizers(self):

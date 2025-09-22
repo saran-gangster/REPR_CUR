@@ -59,6 +59,9 @@ class JEPAObjective(nn.Module):
         self.target_proj = MLP(in_dim=d_model, out_dim=latent_dim,
                                hidden_mult=predictor_hidden_multiplier, dropout=0.0)
 
+        # Freeze EMA teacher so DDP doesn't expect grads from it
+        self.target_proj.requires_grad_(False)
+
         # Predictor operates purely in latent space over [z_anchor, z_k]
         self.predictor = MLP(in_dim=2 * latent_dim, out_dim=latent_dim,
                              hidden_mult=predictor_hidden_multiplier, dropout=dropout)
@@ -129,6 +132,7 @@ class JEPAObjective(nn.Module):
             target = torch.arange(n, device=device)
             loss_h = F.cross_entropy(sim, target)
             info_loss = info_loss + loss_h * (n / max(1, total_n))
+
         # cosine diagnostic (not used for optimization)
         cos_loss = 1.0 - (p * y).sum(dim=-1)
         cos_loss = cos_loss.mean()

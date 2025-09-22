@@ -118,22 +118,23 @@ class LitJEPA(L.LightningModule):
             dist_imposter = d_imp_all.mean()
             imposter_acc = (d_true_all < d_imp_all).float().mean()
 
-        # Existing logs
-        self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val/lm_loss", lm_loss, on_epoch=True)
-        self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True)
-        self.log("val/info_nce_loss", jepa_out["info_nce_loss"], on_epoch=True)
-        self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True)
-        self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True)
-        self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True)
-        self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True)
+        # Epoch-level logs must sync across devices
+        self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
+        self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
+        self.log("val/info_nce_loss", jepa_out["info_nce_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
+        self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
 
         # New logs
-        self.log("val/imposter_acc", imposter_acc, on_epoch=True)
-        self.log("val/dist_true", dist_true, on_epoch=True)
-        self.log("val/dist_imposter", dist_imposter, on_epoch=True)
+        self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
+        self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
+        self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
         # Optional: LM perplexity for interpretability
-        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True)
+        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
         # Per-horizon breakdown (diagnostics)
         with torch.no_grad():
@@ -141,7 +142,7 @@ class LitJEPA(L.LightningModule):
                 mask = (k_ids == hid)
                 if mask.any():
                     acc_h = (d_true_all[mask] < d_imp_all[mask]).float().mean()
-                    self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True)
+                    self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA update after optimizer step would be ideal; keeping here to avoid hook order changes.

@@ -32,18 +32,23 @@ model:
     tau: 0.2
 
     # Gradient decoupling controls
-    # tap_layer is the block index to take JEPA features from.
-    # Supports negative indices (e.g., -2 means output after block n_layers-2).
-    tap_layer: -2
+    # Tap earlier for more semantic signal
+    tap_layer: -3
     grad_barrier: true
+    tap_norm: true
 
     # Loss weights (JEPA and LM apply to different layers now)
     jepa_weight: 1.0
     lm_weight: 1.0
-    # lambda_weight: 0.5  # legacy key, ignored if jepa_weight present
+
+    # Schedules (new)
+    # LM loss is off initially, then ramps up
+    lm_warmup_steps: 1000
+    # EMA momentum cosine schedule from start -> end over lm_warmup_steps
+    ema_schedule: [0.99, 0.9995]
 
   optimizer:
-    lr: 3.0e-4
+    lr: 1.0e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 200

@@ -61,16 +61,28 @@ class LitJEPA(L.LightningModule):
         )
         # Independent weights (back-compat with lambda_weight)
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
-        self.lm_weight = jepa_cfg.get("lm_weight", 1.0)
+        self.lm_weight_final = jepa_cfg.get("lm_weight", 1.0)
 
         # Gradient decoupling controls
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
         self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
+        self.jepa_tap_norm = bool(jepa_cfg.get("tap_norm", False))
+
+        # Schedules
+        self.lm_warmup_steps = int(jepa_cfg.get("lm_warmup_steps", 0))
+        ema_sched = jepa_cfg.get("ema_schedule", None)
+        if isinstance(ema_sched, (list, tuple)) and len(ema_sched) == 2:
+            self.ema_start, self.ema_end = float(ema_sched[0]), float(ema_sched[1])
+        else:
+            # default: no schedule; use static EMA from JEPAObjective
+            self.ema_start, self.ema_end = self.jepa.ema_momentum, self.jepa.ema_momentum
+        # by default, run EMA schedule over lm_warmup_steps
+        self.ema_sched_steps = int(jepa_cfg.get("ema_schedule_steps", self.lm_warmup_steps if self.lm_warmup_steps > 0 else 1))
 
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
 
     def forward(self, x):
-        # keep legacy forward returning final hidden states
+        # legacy forward returning final hidden states
         return self.model(x)  # (B, T, C)
 
     def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -83,22 +95,42 @@ class LitJEPA(L.LightningModule):
         )
         return loss
 
+    def _current_lm_weight(self, step: int) -> float:
+        # linear warmup: 0 until warmup_steps, then ramp to final over the remaining steps
+        if self.lm_weight_final <= 0.0:
+            return 0.0
+        warm = max(0, self.lm_warmup_steps)
+        max_steps = self.trainer.max_steps or (warm + 1)
+        if step < warm:
+            return 0.0
+        # fraction of progress after warmup
+        frac = float(step - warm) / max(1, max_steps - warm)
+        frac = max(0.0, min(1.0, frac))
+        return self.lm_weight_final * frac
+
+    def _current_ema_momentum(self, step: int) -> float:
+        if self.ema_sched_steps <= 0 or self.ema_start == self.ema_end:
+            return self.jepa.ema_momentum
+        t = max(0.0, min(1.0, float(step) / float(self.ema_sched_steps)))
+        alpha = 0.5 * (1.0 - math.cos(math.pi * t))  # cosine ramp 0->1
+        return self.ema_start + (self.ema_end - self.ema_start) * alpha
+
     def training_step(self, batch, batch_idx):
         x = batch  # (B,T) token ids
 
         # Decoupled features: JEPA from tap layer, LM from final layer
         h_jepa, h_final = self.model(
-            x, tap_layer=self.jepa_tap_layer, return_tap=True, grad_barrier=self.jepa_grad_barrier
+            x, tap_layer=self.jepa_tap_layer, return_tap=True,
+            grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
         )
 
         # Losses
-        if self.lm_weight > 0.0:
-            lm_loss = self._lm_loss(h_final, x)
-        else:
-            lm_loss = torch.tensor(0.0, device=self.device)
-
+        lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
         jepa_out = self.jepa(h_jepa)
-        total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
+
+        # Scheduled LM weight
+        eff_lm_w = self._current_lm_weight(self.global_step)
+        total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_out["loss"]
 
         # Logging
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=False)
@@ -111,21 +143,22 @@ class LitJEPA(L.LightningModule):
         self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
         self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
         self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
+        self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
+        self.log("train/ema_momentum", torch.tensor(self.jepa.ema_momentum, device=self.device), on_step=True)
         return total_loss
 
     def validation_step(self, batch, batch_idx):
         x = batch
         with torch.no_grad():
             h_jepa, h_final = self.model(
-                x, tap_layer=self.jepa_tap_layer, return_tap=True, grad_barrier=self.jepa_grad_barrier
+                x, tap_layer=self.jepa_tap_layer, return_tap=True,
+                grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
             )
-            if self.lm_weight > 0.0:
-                lm_loss = self._lm_loss(h_final, x)
-            else:
-                lm_loss = torch.tensor(0.0, device=self.device)
-
+            lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
             jepa_out = self.jepa(h_jepa)
-            total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
+
+            eff_lm_w = self._current_lm_weight(self.global_step)
+            total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_out["loss"]
 
             # Imposter validation on the JEPA layer
             z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)
@@ -156,8 +189,9 @@ class LitJEPA(L.LightningModule):
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
-        if self.lm_weight > 0.0:
+        if self.lm_weight_final > 0.0:
             self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
+        self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
 
         # Per-horizon breakdown (diagnostics)
         with torch.no_grad():
@@ -168,13 +202,17 @@ class LitJEPA(L.LightningModule):
                     self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # EMA update after optimizer step would be ideal; keeping here to avoid hook order changes.
+        # Update EMA momentum according to schedule, then EMA update
+        try:
+            self.jepa.ema_momentum = float(self._current_ema_momentum(self.global_step))
+        except Exception:
+            pass
         self.jepa.momentum_update()
 
     def on_fit_start(self):
         # Toggle grads for modules that are fully unused to avoid DDP unused-param errors
         try:
-            if self.lm_weight <= 0.0:
+            if self.lm_weight_final <= 0.0:
                 for p in self.model.lm_head.parameters():
                     p.requires_grad = False
             if self.jepa_weight <= 0.0:
@@ -198,6 +236,12 @@ class LitJEPA(L.LightningModule):
                     head.weight = self.model.token_emb.weight  # tie weights
                     self.model.lm_head = head
                     self.hparams.vocab_size = new_V
+        except Exception:
+            pass
+
+        # Initialize EMA to schedule start
+        try:
+            self.jepa.ema_momentum = float(self._current_ema_momentum(0))
         except Exception:
             pass
 

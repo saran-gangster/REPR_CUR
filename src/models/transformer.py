@@ -96,16 +96,45 @@ class DecoderOnlyTransformer(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm_f = RMSNorm(d_model)
+        self.n_layers = n_layers
 
         # LM head with weight tying
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight  # tie weights
 
-    def forward(self, idx):
-        # idx: (B, T) token ids
+    def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False, grad_barrier: bool = False):
+        """
+        idx: (B, T) token ids
+        tap_layer: if not None, index of block output to return for JEPA (supports negative index)
+        return_tap: if True, returns (h_tap, h_final). Else returns h_final.
+        grad_barrier: if True and tap_layer is set, detach the graph at the tap so
+                      gradients from layers above the tap do not flow below it.
+        """
+        # idx -> embeddings
         x = self.token_emb(idx)  # (B, T, C)
         x = self.drop(x)
-        for blk in self.blocks:
+
+        tap_idx = None
+        h_tap = None
+        if tap_layer is not None:
+            # normalize negative indexing and clamp into range
+            tl = tap_layer if tap_layer >= 0 else self.n_layers + tap_layer
+            tl = max(0, min(self.n_layers - 1, tl))
+            tap_idx = tl
+
+        for i, blk in enumerate(self.blocks):
             x = blk(x)
-        x = self.norm_f(x)
-        return x  # final hidden states (B, T, C)
+            if tap_idx is not None and i == tap_idx:
+                h_tap = x
+                if grad_barrier:
+                    x = x.detach()
+
+        h_final = self.norm_f(x)
+
+        if return_tap:
+            if h_tap is None:
+                # if tap requested but index invalid, fall back to using final pre-norm (rare)
+                h_tap = x
+            return h_tap, h_final
+        else:
+            return h_final

@@ -59,13 +59,18 @@ class LitJEPA(L.LightningModule):
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
         )
-        # New: independent weights (back-compat with lambda_weight)
+        # Independent weights (back-compat with lambda_weight)
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
         self.lm_weight = jepa_cfg.get("lm_weight", 1.0)
+
+        # Gradient decoupling controls
+        self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
+        self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
 
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
 
     def forward(self, x):
+        # keep legacy forward returning final hidden states
         return self.model(x)  # (B, T, C)
 
     def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -80,15 +85,19 @@ class LitJEPA(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x = batch  # (B,T) token ids
-        h = self(x)
+
+        # Decoupled features: JEPA from tap layer, LM from final layer
+        h_jepa, h_final = self.model(
+            x, tap_layer=self.jepa_tap_layer, return_tap=True, grad_barrier=self.jepa_grad_barrier
+        )
 
         # Losses
         if self.lm_weight > 0.0:
-            lm_loss = self._lm_loss(h, x)
+            lm_loss = self._lm_loss(h_final, x)
         else:
             lm_loss = torch.tensor(0.0, device=self.device)
 
-        jepa_out = self.jepa(h)
+        jepa_out = self.jepa(h_jepa)
         total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
 
         # Logging
@@ -107,17 +116,19 @@ class LitJEPA(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         x = batch
         with torch.no_grad():
-            h = self(x)
+            h_jepa, h_final = self.model(
+                x, tap_layer=self.jepa_tap_layer, return_tap=True, grad_barrier=self.jepa_grad_barrier
+            )
             if self.lm_weight > 0.0:
-                lm_loss = self._lm_loss(h, x)
+                lm_loss = self._lm_loss(h_final, x)
             else:
                 lm_loss = torch.tensor(0.0, device=self.device)
 
-            jepa_out = self.jepa(h)
+            jepa_out = self.jepa(h_jepa)
             total_loss = self.lm_weight * lm_loss + self.jepa_weight * jepa_out["loss"]
 
-            # Imposter validation
-            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h)
+            # Imposter validation on the JEPA layer
+            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)
             p = F.normalize(z_pred, dim=-1)
             y = F.normalize(z_tgt, dim=-1)
             d_true_all = 1.0 - (p * y).sum(dim=-1)  # (N,)
@@ -157,15 +168,26 @@ class LitJEPA(L.LightningModule):
                     self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        # EMA update after optimizer step would be ideal; keeping here to avoid hook order changes.
         self.jepa.momentum_update()
 
     def on_fit_start(self):
+        # Toggle grads for modules that are fully unused to avoid DDP unused-param errors
+        try:
+            if self.lm_weight <= 0.0:
+                for p in self.model.lm_head.parameters():
+                    p.requires_grad = False
+            if self.jepa_weight <= 0.0:
+                for p in self.jepa.parameters():
+                    p.requires_grad = False
+        except Exception:
+            pass
+
         # match vocab to datamodule automatically (so BPE/synthetic "just work")
         try:
             dm = self.trainer.datamodule
             if dm is not None and getattr(dm, "vocab_size", None):
                 new_V = int(dm.vocab_size)
-                # The model has an LM head even if LM loss is off; tie to token_emb.
                 old_V = self.model.lm_head.out_features
                 if new_V != old_V:
                     d_model = self.model.token_emb.embedding_dim
@@ -175,7 +197,6 @@ class LitJEPA(L.LightningModule):
                     head = nn.Linear(d_model, new_V, bias=False).to(device)
                     head.weight = self.model.token_emb.weight  # tie weights
                     self.model.lm_head = head
-                    # Update saved hyperparams for clarity
                     self.hparams.vocab_size = new_V
         except Exception:
             pass

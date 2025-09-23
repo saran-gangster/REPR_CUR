@@ -19,6 +19,10 @@ model:
   ff_multiplier: 4
   use_rope: true
   rope_base: 10000
+
+  # NEW: make weight tying optional and disable for true decoupling
+  weight_tying: false
+
   jepa:
     # JEPA objective params
     latent_dim: 256
@@ -32,19 +36,18 @@ model:
     tau: 0.2
 
     # Gradient decoupling controls
-    # Tap earlier for more semantic signal
     tap_layer: -3
     grad_barrier: true
     tap_norm: true
 
-    # Loss weights (JEPA and LM apply to different layers now)
+    # Loss weights
     jepa_weight: 1.0
     lm_weight: 1.0
 
-    # Schedules (new)
-    # LM loss is off initially, then ramps up
-    lm_warmup_steps: 1000
-    # EMA momentum cosine schedule from start -> end over lm_warmup_steps
+    # Schedules
+    # IMPORTANT: no hard "off" phase; ramp from 0 from step 0
+    lm_warmup_steps: 0
+    # EMA momentum cosine schedule from start -> end over lm_warmup_steps (kept; applies to projector)
     ema_schedule: [0.99, 0.9995]
 
   optimizer:

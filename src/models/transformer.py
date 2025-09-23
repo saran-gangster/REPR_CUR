@@ -87,7 +87,8 @@ class DecoderBlock(nn.Module):
 
 class DecoderOnlyTransformer(nn.Module):
     def __init__(self, vocab_size: int, d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
-                 dropout: float = 0.1, ff_multiplier: int = 4, use_rope: bool = True, rope_base: float = 10000.0):
+                 dropout: float = 0.1, ff_multiplier: int = 4, use_rope: bool = True, rope_base: float = 10000.0,
+                 weight_tying: bool = True):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -98,12 +99,23 @@ class DecoderOnlyTransformer(nn.Module):
         self.norm_f = RMSNorm(d_model)
         self.n_layers = n_layers
 
-        # LM head with weight tying
+        # LM head (weight tying now optional)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight  # tie weights
+        self.weight_tying = bool(weight_tying)
+        if self.weight_tying:
+            self.lm_head.weight = self.token_emb.weight  # optional tie
 
         # Optional normalization at tap to stabilize features
         self.norm_tap = RMSNorm(d_model)
+
+        # NEW: LM-only bridge to adapt detached lower features for the upper LM stack
+        self.lm_bridge = nn.Sequential(
+            RMSNorm(d_model),
+            nn.Linear(d_model, d_model, bias=True),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model, bias=True),
+        )
 
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,
                 grad_barrier: bool = False, tap_norm: bool = False):
@@ -130,11 +142,15 @@ class DecoderOnlyTransformer(nn.Module):
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if tap_idx is not None and i == tap_idx:
+                # Capture JEPA tap BEFORE any detach/bridge
                 h_tap = x
                 if tap_norm:
                     h_tap = self.norm_tap(h_tap)
+                # Detach the LM path to block gradients flowing into lower layers
                 if grad_barrier:
                     x = x.detach()
+                # Apply LM-only bridge after the detach so it does not affect JEPA tap features
+                x = x + self.lm_bridge(x)
 
         h_final = self.norm_f(x)
 

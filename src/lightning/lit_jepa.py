@@ -36,6 +36,8 @@ class LitJEPA(L.LightningModule):
         ff_multiplier: int = 4,
         use_rope: bool = True,
         rope_base: float = 10000,
+        # optional weight tying (default True for back-compat; config sets it False for true decoupling)
+        weight_tying: bool = True,
         jepa: Dict[str, Any] = None,
         optimizer: Dict[str, Any] = None,
     ):
@@ -43,7 +45,8 @@ class LitJEPA(L.LightningModule):
         self.save_hyperparameters(ignore=['optimizer'])
         self.model = DecoderOnlyTransformer(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-            dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base
+            dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base,
+            weight_tying=weight_tying,
         )
         jepa_cfg = jepa or {}
         self.jepa = JEPAObjective(
@@ -74,19 +77,15 @@ class LitJEPA(L.LightningModule):
         if isinstance(ema_sched, (list, tuple)) and len(ema_sched) == 2:
             self.ema_start, self.ema_end = float(ema_sched[0]), float(ema_sched[1])
         else:
-            # default: no schedule; use static EMA from JEPAObjective
             self.ema_start, self.ema_end = self.jepa.ema_momentum, self.jepa.ema_momentum
-        # by default, run EMA schedule over lm_warmup_steps
         self.ema_sched_steps = int(jepa_cfg.get("ema_schedule_steps", self.lm_warmup_steps if self.lm_warmup_steps > 0 else 1))
 
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
 
     def forward(self, x):
-        # legacy forward returning final hidden states
         return self.model(x)  # (B, T, C)
 
     def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        # h: (B, T, C), predict x[:, 1:] from h[:, :-1, :]
         logits = self.model.lm_head(h[:, :-1, :])            # (B, T-1, V)
         targets = x[:, 1:]                                   # (B, T-1)
         loss = F.cross_entropy(
@@ -96,14 +95,12 @@ class LitJEPA(L.LightningModule):
         return loss
 
     def _current_lm_weight(self, step: int) -> float:
-        # linear warmup: 0 until warmup_steps, then ramp to final over the remaining steps
         if self.lm_weight_final <= 0.0:
             return 0.0
         warm = max(0, self.lm_warmup_steps)
         max_steps = self.trainer.max_steps or (warm + 1)
         if step < warm:
             return 0.0
-        # fraction of progress after warmup
         frac = float(step - warm) / max(1, max_steps - warm)
         frac = max(0.0, min(1.0, frac))
         return self.lm_weight_final * frac
@@ -160,19 +157,54 @@ class LitJEPA(L.LightningModule):
             eff_lm_w = self._current_lm_weight(self.global_step)
             total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_out["loss"]
 
-            # Imposter validation on the JEPA layer
-            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)
+            # Compute JEPA validation diagnostics with within-horizon negatives
+            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)  # (N,D), (N,D), (N,)
             p = F.normalize(z_pred, dim=-1)
             y = F.normalize(z_tgt, dim=-1)
-            d_true_all = 1.0 - (p * y).sum(dim=-1)  # (N,)
 
-            # "Imposter" targets: roll by 1 (alternative: random permutation)
-            y_imp = torch.roll(y, shifts=1, dims=0)
-            d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
+            unique_hids = torch.unique(k_ids)
+            total_n = 0
+            correct_sum = 0.0
+            dtrue_sum = 0.0
+            dimp_sum = 0.0
 
-            dist_true = d_true_all.mean()
-            dist_imposter = d_imp_all.mean()
-            imposter_acc = (d_true_all < d_imp_all).float().mean()
+            # Per-horizon logging and aggregation
+            for hid in unique_hids:
+                mask = (k_ids == hid)
+                n_h = int(mask.sum().item())
+                horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
+                # per-horizon metric only meaningful if we have at least 2 samples
+                if n_h >= 2:
+                    p_h = p[horizon_idx]
+                    y_h = y[horizon_idx]
+                    y_imp_h = torch.roll(y_h, shifts=1, dims=0)
+
+                    d_true_h = 1.0 - (p_h * y_h).sum(dim=-1)
+                    d_imp_h = 1.0 - (p_h * y_imp_h).sum(dim=-1)
+
+                    acc_h = (d_true_h < d_imp_h).float().mean()
+                    self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", acc_h, on_epoch=True, sync_dist=True)
+
+                    correct_sum += (d_true_h < d_imp_h).float().sum()
+                    dtrue_sum += d_true_h.sum()
+                    dimp_sum += d_imp_h.sum()
+                    total_n += n_h
+                else:
+                    # still emit a log so dashboards stay consistent; nan if insufficient samples
+                    self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
+
+            if total_n >= 2:
+                dist_true = dtrue_sum / total_n
+                dist_imposter = dimp_sum / total_n
+                imposter_acc = correct_sum / total_n
+            else:
+                # Fallback: global roll across all samples if horizons are too small
+                y_imp = torch.roll(y, shifts=1, dims=0)
+                d_true_all = 1.0 - (p * y).sum(dim=-1)
+                d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
+                dist_true = d_true_all.mean()
+                dist_imposter = d_imp_all.mean()
+                imposter_acc = (d_true_all < d_imp_all).float().mean()
 
         # Epoch-level logs must sync across devices
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
@@ -185,21 +217,13 @@ class LitJEPA(L.LightningModule):
         self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
         self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
 
-        # New logs
+        # New aggregated logs (within-horizon negatives)
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
         if self.lm_weight_final > 0.0:
             self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
-
-        # Per-horizon breakdown (diagnostics)
-        with torch.no_grad():
-            for hid, horizon in enumerate(self.jepa.horizons):
-                mask = (k_ids == hid)
-                if mask.any():
-                    acc_h = (d_true_all[mask] < d_imp_all[mask]).float().mean()
-                    self.log(f"val/imposter_acc_h{horizon}", acc_h, on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Update EMA momentum according to schedule, then EMA update
@@ -233,7 +257,8 @@ class LitJEPA(L.LightningModule):
                     tok = nn.Embedding(new_V, d_model).to(device)
                     self.model.token_emb = tok
                     head = nn.Linear(d_model, new_V, bias=False).to(device)
-                    head.weight = self.model.token_emb.weight  # tie weights
+                    if getattr(self.model, "weight_tying", False):
+                        head.weight = self.model.token_emb.weight
                     self.model.lm_head = head
                     self.hparams.vocab_size = new_V
         except Exception:
@@ -308,3 +333,69 @@ class LitJEPA(L.LightningModule):
                     "frequency": 1
                 },
             }
+
+    # Per-branch gradient clipping to avoid cross-task interference
+    def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
+        try:
+            clip_val = float(gradient_clip_val) if gradient_clip_val is not None else 0.0
+        except Exception:
+            clip_val = 0.0
+        if clip_val is None or clip_val <= 0.0:
+            return  # nothing to do
+
+        try:
+            # Determine tap index as used in the forward path
+            n_layers = getattr(self.model, "n_layers", None)
+            tap_layer = self.jepa_tap_layer
+            if n_layers is None or tap_layer is None:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=clip_val)
+                return
+            tap_idx = tap_layer if tap_layer >= 0 else n_layers + tap_layer
+            tap_idx = max(0, min(n_layers - 1, tap_idx))
+
+            lower_params = []
+            upper_params = []
+
+            # Lower: token_emb + blocks[0..tap_idx] + norm_tap + JEPA heads
+            lower_params += list(self.model.token_emb.parameters())
+            for i, blk in enumerate(self.model.blocks):
+                if i <= tap_idx:
+                    lower_params += list(blk.parameters())
+                else:
+                    upper_params += list(blk.parameters())
+            # norms/bridges
+            lower_params += list(self.model.norm_tap.parameters())
+            upper_params += list(self.model.lm_bridge.parameters())
+            upper_params += list(self.model.norm_f.parameters())
+            upper_params += list(self.model.lm_head.parameters())
+
+            # JEPA heads belong to lower branch
+            lower_params += list(self.jepa.online_proj.parameters())
+            lower_params += list(self.jepa.predictor.parameters())
+            lower_params += list(self.jepa.horizon_emb_latent.parameters())
+
+            # Deduplicate to be safe
+            def uniq(params):
+                seen = set()
+                out = []
+                for p in params:
+                    if p is None:
+                        continue
+                    pid = id(p)
+                    if pid not in seen:
+                        seen.add(pid)
+                        out.append(p)
+                return out
+
+            lower_params = uniq(lower_params)
+            upper_params = uniq(upper_params)
+
+            # Apply per-branch clipping
+            torch.nn.utils.clip_grad_norm_(lower_params, max_norm=clip_val, norm_type=2.0)
+            torch.nn.utils.clip_grad_norm_(upper_params, max_norm=clip_val, norm_type=2.0)
+
+        except Exception:
+            try:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=clip_val, norm_type=2.0)
+            except Exception:
+                pass

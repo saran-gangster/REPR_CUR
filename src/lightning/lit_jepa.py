@@ -138,6 +138,8 @@ class LitJEPA(L.LightningModule):
         self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
         self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
         self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
+        if "std_anchor" in jepa_out:
+            self.log("train/std_anchor", jepa_out["std_anchor"], on_step=True)
         self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
         self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
         self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
@@ -212,6 +214,8 @@ class LitJEPA(L.LightningModule):
         self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
         self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
         self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
+        if "std_anchor" in jepa_out:
+            self.log("val/std_anchor", jepa_out["std_anchor"], on_epoch=True, sync_dist=True)
         self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
 
         # Aggregated within-horizon metrics

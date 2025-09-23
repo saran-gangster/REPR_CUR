@@ -43,26 +43,26 @@ class JEPAObjective(nn.Module):
         self.gamma_cov = gamma_cov
         self.tau = tau
 
-        # Register sampling buffers to avoid per-step device transfers/allocations
+        # Register sampling buffers
         probs = torch.tensor(horizon_probs, dtype=torch.float)
         probs = probs / probs.sum()
         self.register_buffer("horizon_probs", probs)
         self.register_buffer("horizon_values", torch.tensor(horizons, dtype=torch.long))
-        self.horizons = horizons  # keep for logging
+        self.horizons = horizons  # for logging
 
         # Horizon embedding directly in latent space
         self.horizon_emb_latent = nn.Embedding(len(horizons), latent_dim)
 
-        # BYOL-correct: online and target projectors share architecture
+        # Online and target projectors share architecture (EMA teacher)
         self.online_proj = MLP(in_dim=d_model, out_dim=latent_dim,
                                hidden_mult=predictor_hidden_multiplier, dropout=dropout)
         self.target_proj = MLP(in_dim=d_model, out_dim=latent_dim,
                                hidden_mult=predictor_hidden_multiplier, dropout=0.0)
 
-        # Freeze EMA teacher so DDP doesn't expect grads from it
+        # Freeze EMA teacher params
         self.target_proj.requires_grad_(False)
 
-        # Predictor operates purely in latent space over [z_anchor, z_k]
+        # Predictor in latent space over [z_anchor, z_k]
         self.predictor = MLP(in_dim=2 * latent_dim, out_dim=latent_dim,
                              hidden_mult=predictor_hidden_multiplier, dropout=dropout)
 
@@ -91,7 +91,7 @@ class JEPAObjective(nn.Module):
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        h: (B, T, C) final hidden states from transformer
+        h: (B, T, C) hidden states from tapped transformer layer
         Returns dict with loss and diagnostics
         """
         B, T, C = h.shape
@@ -133,18 +133,19 @@ class JEPAObjective(nn.Module):
             loss_h = F.cross_entropy(sim, target)
             info_loss = info_loss + loss_h * (n / max(1, total_n))
 
-        # cosine diagnostic (not used for optimization)
+        # diagnostics: cosine distance (not optimized)
         cos_loss = 1.0 - (p * y).sum(dim=-1)
         cos_loss = cos_loss.mean()
 
-        # VICReg-style regularization only on online branch
-        var_loss = variance_loss(z_pred)
-        cov_loss = covariance_loss(z_pred)
+        # VICReg-style regularization on the ONLINE PROJECTOR's output to prevent collapse
+        var_loss = variance_loss(z_anchor)
+        cov_loss = covariance_loss(z_anchor)
 
         loss = info_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
 
-        # diagnostics: std of teacher and online latents
+        # diagnostics: stds of latents
         std_tgt = z_tgt.std(dim=0, unbiased=False).mean()
+        std_anchor = z_anchor.std(dim=0, unbiased=False).mean()
         std_pred = z_pred.std(dim=0, unbiased=False).mean()
 
         return {
@@ -154,6 +155,7 @@ class JEPAObjective(nn.Module):
             "var_loss": var_loss.detach(),
             "cov_loss": cov_loss.detach(),
             "std_tgt": std_tgt.detach(),
+            "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
             "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float),
         }
@@ -175,7 +177,7 @@ class JEPAObjective(nn.Module):
         h_anchor = h[b_idx, t_idx, :]    # (N, C)
         h_target = h[b_idx, tpos, :]     # (N, C)
 
-        z_anchor = self.online_proj(h_anchor)       # (N, D)
+        z_anchor = self.online_proj(h_anchor)       # (N, D) (unused here; kept for potential future diagnostics)
         z_k = self.horizon_emb_latent(k_ids)        # (N, D)
         z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D)
         z_tgt = self.target_proj(h_target)          # (N, D)

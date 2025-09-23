@@ -173,7 +173,6 @@ class LitJEPA(L.LightningModule):
                 mask = (k_ids == hid)
                 n_h = int(mask.sum().item())
                 horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
-                # per-horizon metric only meaningful if we have at least 2 samples
                 if n_h >= 2:
                     p_h = p[horizon_idx]
                     y_h = y[horizon_idx]
@@ -190,7 +189,6 @@ class LitJEPA(L.LightningModule):
                     dimp_sum += d_imp_h.sum()
                     total_n += n_h
                 else:
-                    # still emit a log so dashboards stay consistent; nan if insufficient samples
                     self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
 
             if total_n >= 2:
@@ -198,7 +196,6 @@ class LitJEPA(L.LightningModule):
                 dist_imposter = dimp_sum / total_n
                 imposter_acc = correct_sum / total_n
             else:
-                # Fallback: global roll across all samples if horizons are too small
                 y_imp = torch.roll(y, shifts=1, dims=0)
                 d_true_all = 1.0 - (p * y).sum(dim=-1)
                 d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
@@ -217,7 +214,7 @@ class LitJEPA(L.LightningModule):
         self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
         self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
 
-        # New aggregated logs (within-horizon negatives)
+        # Aggregated within-horizon metrics
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
@@ -334,8 +331,24 @@ class LitJEPA(L.LightningModule):
                 },
             }
 
-    # Per-branch gradient clipping to avoid cross-task interference
-    def configure_gradient_clipping(self, optimizer, optimizer_idx, gradient_clip_val, gradient_clip_algorithm):
+    # Per-branch gradient clipping; compatible with Lightning variants (with or without optimizer_idx arg)
+    def configure_gradient_clipping(
+        self,
+        optimizer,
+        optimizer_idx: int | None = None,
+        gradient_clip_val: float | None = None,
+        gradient_clip_algorithm: str | None = None,
+        *args,
+        **kwargs,
+    ):
+        # Some Lightning versions pass only (optimizer, gradient_clip_val, gradient_clip_algorithm)
+        # If so, shift arguments accordingly
+        if optimizer_idx is not None and isinstance(optimizer_idx, (float, int)) and gradient_clip_val is None:
+            # Called as (optimizer, gradient_clip_val, gradient_clip_algorithm)
+            gradient_clip_val = float(optimizer_idx)
+            optimizer_idx = None
+            gradient_clip_algorithm = kwargs.get("gradient_clip_algorithm", gradient_clip_algorithm)
+
         try:
             clip_val = float(gradient_clip_val) if gradient_clip_val is not None else 0.0
         except Exception:
@@ -373,6 +386,7 @@ class LitJEPA(L.LightningModule):
             lower_params += list(self.jepa.online_proj.parameters())
             lower_params += list(self.jepa.predictor.parameters())
             lower_params += list(self.jepa.horizon_emb_latent.parameters())
+            # target_proj is EMA/no-grad
 
             # Deduplicate to be safe
             def uniq(params):

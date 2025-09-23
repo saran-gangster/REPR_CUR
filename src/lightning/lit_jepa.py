@@ -227,7 +227,6 @@ class LitJEPA(L.LightningModule):
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # Update EMA momentum according to schedule, then EMA update
         try:
             self.jepa.ema_momentum = float(self._current_ema_momentum(self.global_step))
         except Exception:

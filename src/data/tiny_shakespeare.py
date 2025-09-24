@@ -74,6 +74,7 @@ class TinyShakespeareDataModule(L.LightningDataModule):
     def __init__(self, data_dir: str = "data/", block_size: int = 512, batch_size: int = 32,
                  num_workers: int = 2, download_url: str = None,
                  tokenizer_type: str = "char",
+                 tokenizer_name: str = "cl100k_base",
                  use_synthetic: bool = False,
                  synthetic_vocab_size: int = 16,
                  synthetic_segment_len: int = 192,
@@ -87,6 +88,7 @@ class TinyShakespeareDataModule(L.LightningDataModule):
 
         # new controls
         self.tokenizer_type = tokenizer_type
+        self.tokenizer_name = tokenizer_name
         self.use_synthetic = use_synthetic
         self.synthetic_vocab_size = int(synthetic_vocab_size)
         self.synthetic_segment_len = int(synthetic_segment_len)
@@ -120,14 +122,13 @@ class TinyShakespeareDataModule(L.LightningDataModule):
             tok = ByteTokenizer()
         elif ttype == "tiktoken":
             try:
-                tok = TiktokenTokenizer("cl100k_base")
+                tok = TiktokenTokenizer(self.tokenizer_name)
             except Exception:
-                # graceful fallback to char
+                # graceful fallback to char if tiktoken missing
                 tok = CharTokenizer(text)
         else:
             tok = CharTokenizer(text)
         return tok
-
     def _make_synthetic_data(self, total_tokens: int) -> np.ndarray:
         # Build a long 1D array with repeated segments, each segment uses a unique token id.
         # Reserve 0 as a separator token (optional).

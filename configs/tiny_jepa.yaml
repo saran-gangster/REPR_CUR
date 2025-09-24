@@ -1,4 +1,4 @@
-seed_everything: 1337
+seed_everything: 48
 
 trainer:
   max_steps: 3000
@@ -27,13 +27,13 @@ model:
     # JEPA objective params
     latent_dim: 256
     predictor_hidden_multiplier: 1.5
-    horizons: [8, 32, 128]
-    horizon_probs: [0.5, 0.3, 0.2]
+    horizons: [2,8,32]
+    horizon_probs: [0.6, 0.3, 0.1]
     pairs_per_seq: 64
     ema_momentum: 0.995
     gamma_var: 1.0
     gamma_cov: 1.0
-    tau: 0.2
+    tau: 0.1
 
     # Gradient decoupling controls
     tap_layer: -3
@@ -51,7 +51,8 @@ model:
     ema_schedule: [0.99, 0.9995]
 
   optimizer:
-    lr: 1.0e-4
+    lr: 5.0e-5
+    lr_head: 5.0e-6
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 200
@@ -64,7 +65,7 @@ data:
   download_url: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 
   # tokenizer + synthetic controls
-  tokenizer_type: char   # char | byte | tiktoken
+  tokenizer_type: tiktoken   # char | byte | tiktoken
   use_synthetic: false
   synthetic_vocab_size: 16
   synthetic_segment_len: 192

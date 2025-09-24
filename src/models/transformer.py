@@ -108,7 +108,7 @@ class DecoderOnlyTransformer(nn.Module):
         # Optional normalization at tap to stabilize features
         self.norm_tap = RMSNorm(d_model)
 
-        # NEW: LM-only bridge to adapt detached lower features for the upper LM stack
+        # LM-only bridge to adapt detached lower features for the upper LM stack
         self.lm_bridge = nn.Sequential(
             RMSNorm(d_model),
             nn.Linear(d_model, d_model, bias=True),
@@ -116,6 +116,8 @@ class DecoderOnlyTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model, bias=True),
         )
+        # NEW: learnable gate for the bridge, initialized near zero (sigmoid(-2) ~ 0.12)
+        self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
 
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,
                 grad_barrier: bool = False, tap_norm: bool = False):
@@ -139,6 +141,9 @@ class DecoderOnlyTransformer(nn.Module):
             tl = max(0, min(self.n_layers - 1, tl))
             tap_idx = tl
 
+        # bridge gate (scalar in [0,1])
+        g = torch.sigmoid(self.lm_bridge_gate)
+
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if tap_idx is not None and i == tap_idx:
@@ -149,8 +154,8 @@ class DecoderOnlyTransformer(nn.Module):
                 # Detach the LM path to block gradients flowing into lower layers
                 if grad_barrier:
                     x = x.detach()
-                # Apply LM-only bridge after the detach so it does not affect JEPA tap features
-                x = x + self.lm_bridge(x)
+                # Apply gated LM-only bridge after the detach
+                x = x + g * self.lm_bridge(x)
 
         h_final = self.norm_f(x)
 

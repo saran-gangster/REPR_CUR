@@ -1,7 +1,6 @@
 from typing import Any, Dict
 import os
 import math
-import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -264,6 +263,16 @@ class LitJEPA(L.LightningModule):
         except Exception:
             pass
 
+        # Ensure a sane EMA schedule length if unspecified or degenerate
+        try:
+            if getattr(self, "ema_sched_steps", None) in (None, 0, 1):
+                try:
+                    self.ema_sched_steps = int(self.trainer.max_steps or 1000)
+                except Exception:
+                    self.ema_sched_steps = 1000
+        except Exception:
+            self.ema_sched_steps = 1000
+
         # Initialize EMA to schedule start
         try:
             self.jepa.ema_momentum = float(self._current_ema_momentum(0))
@@ -292,7 +301,7 @@ class LitJEPA(L.LightningModule):
                     lg.watch(self, log="gradients", log_freq=200)
         elif isinstance(logger, WandbLogger):
             logger.watch(self, log="gradients", log_freq=200)
-
+            
     def setup(self, stage: str):
         # Optional compilation for extra speed on CUDA: export TORCH_COMPILE=1
         if hasattr(torch, "compile") and os.getenv("TORCH_COMPILE", "0") == "1":
@@ -306,19 +315,39 @@ class LitJEPA(L.LightningModule):
     def configure_optimizers(self):
         wd = self.optim_cfg.get("weight_decay", 0.1)
         betas = self.optim_cfg.get("betas", (0.9, 0.95))
-        lr = self.optim_cfg.get("lr", 3e-4)
+        lr_backbone = self.optim_cfg.get("lr", 3e-4)  # backbone LR
+        lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)  # head/embedding LR
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
+        # Parameter partition
+        head_params = list(self.model.token_emb.parameters()) + list(self.model.lm_head.parameters())
+        head_ids = {id(p) for p in head_params}
+        backbone_params = [p for p in self.parameters() if id(p) not in head_ids]
+
+        def split_decay(params):
+            decay, no_decay = [], []
+            for p in params:
+                if p is None or not p.requires_grad:
+                    continue
+                # 1D params (norm scales, biases) -> no weight decay
+                if p.ndim == 1:
+                    no_decay.append(p)
+                else:
+                    decay.append(p)
+            return decay, no_decay
+
+        head_decay, head_no_decay = split_decay(head_params)
+        bb_decay, bb_no_decay = split_decay(backbone_params)
+
+        param_groups = [
+            {"params": head_decay, "lr": lr_head, "weight_decay": wd},
+            {"params": head_no_decay, "lr": lr_head, "weight_decay": 0.0},
+            {"params": bb_decay, "lr": lr_backbone, "weight_decay": wd},
+            {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
+        ]
+
         AdamW = torch.optim.AdamW
-        optimizer = None
-        try:
-            # Use fused AdamW on CUDA if available
-            if "fused" in inspect.signature(AdamW).parameters and torch.cuda.is_available():
-                optimizer = AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=wd, fused=True)
-        except Exception:
-            optimizer = None
-        if optimizer is None:
-            optimizer = AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=wd)
+        optimizer = AdamW(param_groups, betas=betas)  # lr is per-group now
 
         if self.trainer.max_steps is None:
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
@@ -332,8 +361,8 @@ class LitJEPA(L.LightningModule):
                     "interval": "step",
                     "frequency": 1
                 },
-            }
-
+            }          
+            
     # Per-branch gradient clipping; compatible with Lightning variants (with or without optimizer_idx arg)
     def configure_gradient_clipping(
         self,

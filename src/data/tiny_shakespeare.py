@@ -35,6 +35,30 @@ class ByteTokenizer:
         except Exception:
             return ""
 
+class SentencePieceTokenizer:
+    def __init__(self, model_file: str):
+        try:
+            import sentencepiece as spm  # type: ignore
+        except Exception as e:
+            raise ImportError("sentencepiece not installed. pip install sentencepiece") from e
+        self.sp = spm.SentencePieceProcessor()
+        ok = self.sp.load(model_file)
+        if not ok:
+            raise ValueError(f"Failed to load SentencePiece model from {model_file}")
+        self.vocab_size = self.sp.get_piece_size()
+        self.model_file = model_file
+
+    def encode(self, s: str):
+        # returns list[int]
+        return list(self.sp.encode(s, out_type=int))
+
+    def decode(self, ids):
+        # ids can be list[int] or np.ndarray
+        try:
+            return self.sp.decode(ids)
+        except Exception:
+            return ""
+        
 class TiktokenTokenizer:
     def __init__(self, name: str = "cl100k_base"):
         try:
@@ -72,13 +96,14 @@ class CharDataset(Dataset):
 
 class TinyShakespeareDataModule(L.LightningDataModule):
     def __init__(self, data_dir: str = "data/", block_size: int = 512, batch_size: int = 32,
-                 num_workers: int = 2, download_url: str = None,
-                 tokenizer_type: str = "char",
-                 tokenizer_name: str = "cl100k_base",
-                 use_synthetic: bool = False,
-                 synthetic_vocab_size: int = 16,
-                 synthetic_segment_len: int = 192,
-                 synthetic_num_segments: int = 3):
+                num_workers: int = 2, download_url: str = None,
+                tokenizer_type: str = "char",
+                tokenizer_name: str = "cl100k_base",
+                tokenizer_path: Optional[str] = None,
+                use_synthetic: bool = False,
+                synthetic_vocab_size: int = 16,
+                synthetic_segment_len: int = 192,
+                synthetic_num_segments: int = 3):
         super().__init__()
         self.data_dir = data_dir
         self.block_size = block_size
@@ -88,7 +113,8 @@ class TinyShakespeareDataModule(L.LightningDataModule):
 
         # new controls
         self.tokenizer_type = tokenizer_type
-        self.tokenizer_name = tokenizer_name
+        self.tokenizer_name = tokenizer_name         # used for tiktoken
+        self.tokenizer_path = tokenizer_path         # used for sentencepiece
         self.use_synthetic = use_synthetic
         self.synthetic_vocab_size = int(synthetic_vocab_size)
         self.synthetic_segment_len = int(synthetic_segment_len)
@@ -124,11 +150,15 @@ class TinyShakespeareDataModule(L.LightningDataModule):
             try:
                 tok = TiktokenTokenizer(self.tokenizer_name)
             except Exception:
-                # graceful fallback to char if tiktoken missing
-                tok = CharTokenizer(text)
+                tok = CharTokenizer(text)  # graceful fallback
+        elif ttype == "sentencepiece":
+            assert self.tokenizer_path is not None and len(self.tokenizer_path) > 0, \
+                "Provide --data.tokenizer_path pointing to a SentencePiece .model file"
+            tok = SentencePieceTokenizer(self.tokenizer_path)
         else:
             tok = CharTokenizer(text)
         return tok
+    
     def _make_synthetic_data(self, total_tokens: int) -> np.ndarray:
         # Build a long 1D array with repeated segments, each segment uses a unique token id.
         # Reserve 0 as a separator token (optional).

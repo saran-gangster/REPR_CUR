@@ -3,3 +3,11 @@ pytorch-lightning
 numpy
 requests
 tqdm
+sentencepiece
+jsonargparse[signatures]>=4.27.7
+tensorboardX
+tensorboard
+wandb
+tiktoken
+lightning
+sentencepiece

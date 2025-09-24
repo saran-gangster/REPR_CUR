@@ -114,123 +114,177 @@ class LitJEPA(L.LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch  # (B,T) token ids
 
-        # Decoupled features: JEPA from tap layer, LM from final layer
-        h_jepa, h_final = self.model(
-            x, tap_layer=self.jepa_tap_layer, return_tap=True,
-            grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
-        )
+        use_jepa = self.jepa_weight > 0.0
+
+        if use_jepa:
+            # Decoupled features: JEPA from tap layer, LM from final layer
+            h_jepa, h_final = self.model(
+                x, tap_layer=self.jepa_tap_layer, return_tap=True,
+                grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
+            )
+        else:
+            # Skip tap path to save compute when JEPA is off
+            h_final = self.model(x, tap_layer=None, return_tap=False)
+            h_jepa = None
 
         # Losses
         lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
-        jepa_out = self.jepa(h_jepa)
+        if use_jepa:
+            jepa_out = self.jepa(h_jepa)
+            jepa_loss = jepa_out["loss"]
+        else:
+            jepa_out = {}
+            jepa_loss = torch.tensor(0.0, device=self.device)
 
         # Scheduled LM weight
         eff_lm_w = self._current_lm_weight(self.global_step)
-        total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_out["loss"]
+        total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
         # Logging
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=False)
         self.log("train/lm_loss", lm_loss, on_step=True)
-        self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
-        self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_step=True)
-        self.log("train/cos_loss", jepa_out["cos_loss"], on_step=True)
-        self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
-        self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
-        self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
-        if "std_anchor" in jepa_out:
-            self.log("train/std_anchor", jepa_out["std_anchor"], on_step=True)
-        self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
-        self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
+        if use_jepa:
+            self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
+            self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_step=True)
+            self.log("train/cos_loss", jepa_out["cos_loss"], on_step=True)
+            self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
+            self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
+            self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
+            if "std_anchor" in jepa_out:
+                self.log("train/std_anchor", jepa_out["std_anchor"], on_step=True)
+            self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
+            self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
+        else:
+            # keep metric keys present but harmless when JEPA is disabled
+            zero = torch.tensor(0.0, device=self.device)
+            self.log("train/jepa_loss", zero, on_step=True)
+            self.log("train/info_nce_loss", zero, on_step=True)
+            self.log("train/cos_loss", zero, on_step=True)
+            self.log("train/var_loss", zero, on_step=True)
+            self.log("train/cov_loss", zero, on_step=True)
+            self.log("train/std_tgt", zero, on_step=True)
+            self.log("train/std_pred", zero, on_step=True)
+            self.log("train/num_pairs", zero, on_step=True)
+
         self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
         self.log("train/ema_momentum", torch.tensor(self.jepa.ema_momentum, device=self.device), on_step=True)
         return total_loss
 
     def validation_step(self, batch, batch_idx):
         x = batch
+        use_jepa = self.jepa_weight > 0.0
+
         with torch.no_grad():
-            h_jepa, h_final = self.model(
-                x, tap_layer=self.jepa_tap_layer, return_tap=True,
-                grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
-            )
+            if use_jepa:
+                h_jepa, h_final = self.model(
+                    x, tap_layer=self.jepa_tap_layer, return_tap=True,
+                    grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
+                )
+            else:
+                h_final = self.model(x, tap_layer=None, return_tap=False)
+                h_jepa = None
+
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
-            jepa_out = self.jepa(h_jepa)
+            if use_jepa:
+                jepa_out = self.jepa(h_jepa)
+                jepa_loss = jepa_out["loss"]
+            else:
+                jepa_out = {}
+                jepa_loss = torch.tensor(0.0, device=self.device)
 
             eff_lm_w = self._current_lm_weight(self.global_step)
-            total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_out["loss"]
+            total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
-            # Compute JEPA validation diagnostics with within-horizon negatives
-            z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)  # (N,D), (N,D), (N,)
-            p = F.normalize(z_pred, dim=-1)
-            y = F.normalize(z_tgt, dim=-1)
+            if use_jepa:
+                # Compute JEPA validation diagnostics with within-horizon negatives
+                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)  # (N,D), (N,D), (N,)
+                p = torch.nn.functional.normalize(z_pred, dim=-1)
+                y = torch.nn.functional.normalize(z_tgt, dim=-1)
 
-            unique_hids = torch.unique(k_ids)
-            total_n = 0
-            correct_sum = 0.0
-            dtrue_sum = 0.0
-            dimp_sum = 0.0
+                unique_hids = torch.unique(k_ids)
+                total_n = 0
+                correct_sum = 0.0
+                dtrue_sum = 0.0
+                dimp_sum = 0.0
 
-            # Per-horizon logging and aggregation
-            for hid in unique_hids:
-                mask = (k_ids == hid)
-                n_h = int(mask.sum().item())
-                horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
-                if n_h >= 2:
-                    p_h = p[horizon_idx]
-                    y_h = y[horizon_idx]
-                    y_imp_h = torch.roll(y_h, shifts=1, dims=0)
+                for hid in unique_hids:
+                    mask = (k_ids == hid)
+                    n_h = int(mask.sum().item())
+                    horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
+                    if n_h >= 2:
+                        p_h = p[horizon_idx]
+                        y_h = y[horizon_idx]
+                        y_imp_h = torch.roll(y_h, shifts=1, dims=0)
 
-                    d_true_h = 1.0 - (p_h * y_h).sum(dim=-1)
-                    d_imp_h = 1.0 - (p_h * y_imp_h).sum(dim=-1)
+                        d_true_h = 1.0 - (p_h * y_h).sum(dim=-1)
+                        d_imp_h = 1.0 - (p_h * y_imp_h).sum(dim=-1)
 
-                    acc_h = (d_true_h < d_imp_h).float().mean()
-                    self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", acc_h, on_epoch=True, sync_dist=True)
+                        acc_h = (d_true_h < d_imp_h).float().mean()
+                        self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", acc_h, on_epoch=True, sync_dist=True)
 
-                    correct_sum += (d_true_h < d_imp_h).float().sum()
-                    dtrue_sum += d_true_h.sum()
-                    dimp_sum += d_imp_h.sum()
-                    total_n += n_h
+                        correct_sum += (d_true_h < d_imp_h).float().sum()
+                        dtrue_sum += d_true_h.sum()
+                        dimp_sum += d_imp_h.sum()
+                        total_n += n_h
+                    else:
+                        self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
+
+                if total_n >= 2:
+                    dist_true = dtrue_sum / total_n
+                    dist_imposter = dimp_sum / total_n
+                    imposter_acc = correct_sum / total_n
                 else:
-                    self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
-
-            if total_n >= 2:
-                dist_true = dtrue_sum / total_n
-                dist_imposter = dimp_sum / total_n
-                imposter_acc = correct_sum / total_n
+                    y_imp = torch.roll(y, shifts=1, dims=0)
+                    d_true_all = 1.0 - (p * y).sum(dim=-1)
+                    d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
+                    dist_true = d_true_all.mean()
+                    dist_imposter = d_imp_all.mean()
+                    imposter_acc = (d_true_all < d_imp_all).float().mean()
             else:
-                y_imp = torch.roll(y, shifts=1, dims=0)
-                d_true_all = 1.0 - (p * y).sum(dim=-1)
-                d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
-                dist_true = d_true_all.mean()
-                dist_imposter = d_imp_all.mean()
-                imposter_acc = (d_true_all < d_imp_all).float().mean()
+                # JEPA disabled: produce benign placeholders
+                imposter_acc = torch.tensor(0.0, device=self.device)
+                dist_true = torch.tensor(0.0, device=self.device)
+                dist_imposter = torch.tensor(0.0, device=self.device)
 
         # Epoch-level logs must sync across devices
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
-        self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
-        self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
-        self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
-        self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
-        self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
-        self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
-        if "std_anchor" in jepa_out:
-            self.log("val/std_anchor", jepa_out["std_anchor"], on_epoch=True, sync_dist=True)
-        self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
+        if use_jepa:
+            self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
+            self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
+            self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
+            self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
+            self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
+            self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
+            if "std_anchor" in jepa_out:
+                self.log("val/std_anchor", jepa_out["std_anchor"], on_epoch=True, sync_dist=True)
+            self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
+        else:
+            zero = torch.tensor(0.0, device=self.device)
+            self.log("val/jepa_loss", zero, on_epoch=True, sync_dist=True)
+            self.log("val/info_nce_loss", zero, on_epoch=True, sync_dist=True)
+            self.log("val/cos_loss", zero, on_epoch=True, sync_dist=True)
+            self.log("val/var_loss", zero, on_epoch=True, sync_dist=True)
+            self.log("val/cov_loss", zero, on_epoch=True, sync_dist=True)
+            self.log("val/std_tgt", zero, on_epoch=True, sync_dist=True)
+            self.log("val/std_pred", zero, on_epoch=True, sync_dist=True)
 
-        # Aggregated within-horizon metrics
+        # Aggregated within-horizon metrics (or zeros if JEPA disabled)
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
         if self.lm_weight_final > 0.0:
             self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
-
+        
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        try:
-            self.jepa.ema_momentum = float(self._current_ema_momentum(self.global_step))
-        except Exception:
-            pass
-        self.jepa.momentum_update()
+        # Only update EMA if JEPA is active
+        if self.jepa_weight > 0.0:
+            try:
+                self.jepa.ema_momentum = float(self._current_ema_momentum(self.global_step))
+            except Exception:
+                pass
+            self.jepa.momentum_update()
 
     def on_fit_start(self):
         # Toggle grads for modules that are fully unused to avoid DDP unused-param errors

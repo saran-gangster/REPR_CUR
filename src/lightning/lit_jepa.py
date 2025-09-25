@@ -289,16 +289,31 @@ class LitJEPA(L.LightningModule):
     def on_fit_start(self):
         # Toggle grads for modules that are fully unused to avoid DDP unused-param errors
         try:
+            # Freeze LM head entirely if LM is disabled
             if self.lm_weight_final <= 0.0:
                 for p in self.model.lm_head.parameters():
                     p.requires_grad = False
+
+            # If JEPA is disabled, freeze its heads AND tap/bridge modules (unused in this mode)
             if self.jepa_weight <= 0.0:
                 for p in self.jepa.parameters():
                     p.requires_grad = False
+                # Norm at tap and LM-only bridge are unused when tap path is not enabled
+                for p in self.model.norm_tap.parameters():
+                    p.requires_grad = False
+                for p in self.model.lm_bridge.parameters():
+                    p.requires_grad = False
+                if hasattr(self.model, "lm_bridge_gate") and self.model.lm_bridge_gate is not None:
+                    self.model.lm_bridge_gate.requires_grad = False
+            else:
+                # JEPA enabled: if tap_norm is disabled, norm_tap would be unused -> freeze it
+                if not self.jepa_tap_norm and hasattr(self.model, "norm_tap"):
+                    for p in self.model.norm_tap.parameters():
+                        p.requires_grad = False
         except Exception:
             pass
 
-        # match vocab to datamodule automatically (so BPE/synthetic "just work")
+        # match vocab to datamodule automatically (so BPE "just work")
         try:
             dm = self.trainer.datamodule
             if dm is not None and getattr(dm, "vocab_size", None):

@@ -103,9 +103,8 @@ class DecoderOnlyTransformer(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.weight_tying = bool(weight_tying)
         if self.weight_tying:
-            self.lm_head.weight = self.token_emb.weight  # optional tie
+            self.lm_head.weight = self.token_emb.weight  
 
-        # Optional normalization at tap to stabilize features
         self.norm_tap = RMSNorm(d_model)
 
         # LM-only bridge to adapt detached lower features for the upper LM stack
@@ -116,7 +115,6 @@ class DecoderOnlyTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, d_model, bias=True),
         )
-        # NEW: learnable gate for the bridge, initialized near zero (sigmoid(-2) ~ 0.12)
         self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
 
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,

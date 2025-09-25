@@ -35,7 +35,6 @@ class LitJEPA(L.LightningModule):
         ff_multiplier: int = 4,
         use_rope: bool = True,
         rope_base: float = 10000,
-        # optional weight tying (default True for back-compat; config sets it False for true decoupling)
         weight_tying: bool = True,
         jepa: Dict[str, Any] = None,
         optimizer: Dict[str, Any] = None,
@@ -61,16 +60,19 @@ class LitJEPA(L.LightningModule):
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
         )
-        # Independent weights (back-compat with lambda_weight)
+        # JEPA/LM weights
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
-        self.lm_weight_final = jepa_cfg.get("lm_weight", 1.0)
+        self.lm_weight_final = float(jepa_cfg.get("lm_weight", 1.0))
 
-        # Baseline flag: disables JEPA and turns off LM-weight scheduler
+        # Baseline flag (disables JEPA; scheduler control is independent below)
         self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
         if self.run_baseline:
             self.jepa_weight = 0.0
-            self.lm_weight_final = 1.0
-            # scheduler will be bypassed in _current_lm_weight
+
+        # Dedicated control for LM weight scheduling
+        # - When False, lm_weight is used as a constant from step 0
+        # - When True, lm_weight is the final target of the scheduler
+        self.lm_weight_use_scheduler = bool(jepa_cfg.get("lm_weight_use_scheduler", not self.run_baseline))
 
         # Gradient decoupling controls
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
@@ -87,7 +89,7 @@ class LitJEPA(L.LightningModule):
         self.ema_sched_steps = int(jepa_cfg.get("ema_schedule_steps", self.lm_warmup_steps if self.lm_warmup_steps > 0 else 1))
 
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
-
+        
     def forward(self, x):
         return self.model(x)  # (B, T, C)
 
@@ -101,9 +103,9 @@ class LitJEPA(L.LightningModule):
         return loss
 
     def _current_lm_weight(self, step: int) -> float:
-        # In baseline mode, use constant LM weight from step 0 (scheduler OFF)
-        if self.run_baseline:
-            return float(self.lm_weight_final)
+        # If scheduler is disabled, use lm_weight as a constant from step 0
+        if not self.lm_weight_use_scheduler:
+            return max(0.0, float(self.lm_weight_final))
 
         if self.lm_weight_final <= 0.0:
             return 0.0
@@ -113,7 +115,7 @@ class LitJEPA(L.LightningModule):
             return 0.0
         frac = float(step - warm) / max(1, max_steps - warm)
         frac = max(0.0, min(1.0, frac))
-        return self.lm_weight_final * frac
+        return float(self.lm_weight_final) * frac
 
     def _current_ema_momentum(self, step: int) -> float:
         if self.ema_sched_steps <= 0 or self.ema_start == self.ema_end:

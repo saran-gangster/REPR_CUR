@@ -25,7 +25,7 @@ model:
   jepa:
     latent_dim: 256
     predictor_hidden_multiplier: 1.5
-    horizons: [2,8,32]
+    horizons: [2, 8, 32]
     horizon_probs: [0.6, 0.3, 0.1]
     pairs_per_seq: 64
     ema_momentum: 0.995
@@ -35,18 +35,18 @@ model:
     tap_layer: -3
     grad_barrier: true
     tap_norm: true
-    jepa_weight: 1.0
-    lm_weight: 1.0
-    # Set this to true for a clean LM-only baseline:
-    # - JEPA disabled
-    # - LM weight scheduler OFF (constant weight from step 0)
-    run_baseline: false
 
-    # Schedules (ignored when run_baseline=true)
-    # IMPORTANT: no hard "off" phase; ramp from 0 from step 0
+    # Loss mixing
+    jepa_weight: 1.0
+    lm_weight: 0.5
+    lm_weight_use_scheduler: false
+
+    # Schedules (ignored when lm_weight_use_scheduler=false)
     lm_warmup_steps: 0
-    # EMA momentum cosine schedule from start -> end over lm_warmup_steps (kept; applies to projector)
     ema_schedule: [0.99, 0.9995]
+
+    # Baseline toggle (leave false for JEPA experiments)
+    run_baseline: false
 
   optimizer:
     lr: 5.0e-5
@@ -61,6 +61,5 @@ data:
   batch_size: 32
   num_workers: 2
   download_url: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-  # Standardized on a self-training HF BPE tokenizer
   bpe_vocab_size: 1024
   bpe_lowercase: true

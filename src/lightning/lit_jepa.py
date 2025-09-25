@@ -65,6 +65,13 @@ class LitJEPA(L.LightningModule):
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
         self.lm_weight_final = jepa_cfg.get("lm_weight", 1.0)
 
+        # Baseline flag: disables JEPA and turns off LM-weight scheduler
+        self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
+        if self.run_baseline:
+            self.jepa_weight = 0.0
+            self.lm_weight_final = 1.0
+            # scheduler will be bypassed in _current_lm_weight
+
         # Gradient decoupling controls
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
         self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
@@ -94,6 +101,10 @@ class LitJEPA(L.LightningModule):
         return loss
 
     def _current_lm_weight(self, step: int) -> float:
+        # In baseline mode, use constant LM weight from step 0 (scheduler OFF)
+        if self.run_baseline:
+            return float(self.lm_weight_final)
+
         if self.lm_weight_final <= 0.0:
             return 0.0
         warm = max(0, self.lm_warmup_steps)
@@ -136,7 +147,7 @@ class LitJEPA(L.LightningModule):
             jepa_out = {}
             jepa_loss = torch.tensor(0.0, device=self.device)
 
-        # Scheduled LM weight
+        # Scheduled LM weight (constant when run_baseline=True)
         eff_lm_w = self._current_lm_weight(self.global_step)
         total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 

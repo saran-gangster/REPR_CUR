@@ -37,7 +37,12 @@ model:
     tap_norm: true
     jepa_weight: 1.0
     lm_weight: 1.0
-    # Schedules
+    # Set this to true for a clean LM-only baseline:
+    # - JEPA disabled
+    # - LM weight scheduler OFF (constant weight from step 0)
+    run_baseline: false
+
+    # Schedules (ignored when run_baseline=true)
     # IMPORTANT: no hard "off" phase; ramp from 0 from step 0
     lm_warmup_steps: 0
     # EMA momentum cosine schedule from start -> end over lm_warmup_steps (kept; applies to projector)

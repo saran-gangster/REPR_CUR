@@ -79,14 +79,15 @@ class JEPAObjective(nn.Module):
         # EMA update for target projector from online projector
         update_ema_(self.target_proj, self.online_proj, self.ema_momentum)
 
-    def _sample_pairs(self, B: int, T: int, device):
+    def _sample_pairs(self, B: int, T: int, device, generator: torch.Generator | None = None):
         return sample_anchor_target_pairs(
             batch_size=B,
             seq_len=T,
             pairs_per_seq=self.pairs_per_seq,
             horizon_values=self.horizon_values,
             horizon_probs=self.horizon_probs,
-            device=device
+            device=device,
+            generator=generator,
         )
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -161,23 +162,34 @@ class JEPAObjective(nn.Module):
         }
 
     @torch.no_grad()
-    def compute_latents(self, h: torch.Tensor):
+    def compute_latents(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None):
         """
-        Utility for validation: sample pairs and return prediction/target latents.
+        Utility for validation: return prediction/target latents using either:
+        - provided fixed pairs (b_idx, t_idx, tpos, k_ids), or
+        - freshly sampled pairs if pairs is None.
         Returns:
-          z_pred: (N, D)
-          z_tgt:  (N, D)
-          k_ids:  (N,) horizon category ids
+        z_pred: (N, D)
+        z_tgt:  (N, D)
+        k_ids:  (N,) horizon category ids
         """
         B, T, C = h.shape
         device = h.device
 
-        b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+        if pairs is None:
+            b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+        else:
+            b_idx, t_idx, tpos, k_ids = pairs
+            # move to correct device if needed
+            if b_idx.device != device:
+                b_idx = b_idx.to(device)
+                t_idx = t_idx.to(device)
+                tpos = tpos.to(device)
+                k_ids = k_ids.to(device)
 
         h_anchor = h[b_idx, t_idx, :]    # (N, C)
         h_target = h[b_idx, tpos, :]     # (N, C)
 
-        z_anchor = self.online_proj(h_anchor)       # (N, D) (unused here; kept for potential future diagnostics)
+        z_anchor = self.online_proj(h_anchor)       # (N, D)
         z_k = self.horizon_emb_latent(k_ids)        # (N, D)
         z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D)
         z_tgt = self.target_proj(h_target)          # (N, D)

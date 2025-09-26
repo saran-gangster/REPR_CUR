@@ -43,6 +43,25 @@ class CharDataset(Dataset):
         x = self.data[start : start + self.block_size]
         return torch.tensor(x, dtype=torch.long)
 
+class EvalDataset(Dataset):
+    """
+    Deterministic, non-overlapping windows for validation to stabilize val metrics.
+    """
+    def __init__(self, data: np.ndarray, block_size: int):
+        self.data = data
+        self.block_size = block_size
+        L = len(self.data)
+        # number of full, non-overlapping windows
+        self.n = max(1, (L - 1) // block_size)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        start = idx * self.block_size
+        x = self.data[start : start + self.block_size]
+        return torch.tensor(x, dtype=torch.long)
+
 # --- DataModule -------------------------------------------------------------
 
 class TinyShakespeareDataModule(L.LightningDataModule):
@@ -145,7 +164,8 @@ class TinyShakespeareDataModule(L.LightningDataModule):
         self.val_data = data[split_idx:]
 
         self.train_ds = CharDataset(self.train_data, self.block_size)
-        self.val_ds = CharDataset(self.val_data, self.block_size)
+        # Use deterministic windows for val
+        self.val_ds = EvalDataset(self.val_data, self.block_size)
 
     def train_dataloader(self):
         kwargs = dict(

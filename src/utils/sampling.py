@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
 import torch
 
 def sample_anchor_target_pairs(
@@ -7,7 +7,8 @@ def sample_anchor_target_pairs(
     pairs_per_seq: int,
     horizon_values: Union[torch.Tensor, List[int]],
     horizon_probs: torch.Tensor,
-    device=None
+    device=None,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
@@ -32,18 +33,16 @@ def sample_anchor_target_pairs(
     b_idx = torch.arange(batch_size, device=device).repeat_interleave(pairs_per_seq)
 
     # sample horizons
-    k_ids = torch.multinomial(horizon_probs, num_samples=N, replacement=True)
+    k_ids = torch.multinomial(horizon_probs, num_samples=N, replacement=True, generator=generator)
     k_vals = horizon_values[k_ids]  # (N,)
 
-    # sample anchors with per-sample max to avoid clamping bias
-    # max valid anchor index so that t + k <= T-1
+    # per-sample max anchor index so that t + k <= T-1
     max_t = (seq_len - 1 - k_vals).clamp(min=0)  # (N,)
     # uniform integer in [0, max_t] per sample
-    t_idx = (torch.rand(N, device=device) * (max_t + 1).to(torch.float)).floor().to(torch.long)
+    t_idx = (torch.rand(N, device=device, generator=generator) * (max_t + 1).to(torch.float)).floor().to(torch.long)
 
     # target positions
     tpos = t_idx + k_vals
-    # ensure strictly within sequence (paranoia)
     tpos = torch.clamp(tpos, max=seq_len - 1)
 
     return b_idx, t_idx, tpos, k_ids

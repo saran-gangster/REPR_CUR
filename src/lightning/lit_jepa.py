@@ -182,7 +182,27 @@ class LitJEPA(L.LightningModule):
         self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
         self.log("train/ema_momentum", torch.tensor(self.jepa.ema_momentum, device=self.device), on_step=True)
         return total_loss
+    
+    def on_validation_epoch_start(self):
+        # reset fixed sampling per epoch for deterministic JEPA validation
+        self._val_pairs = None
+    
+    def _get_or_make_val_pairs(self, B: int, T: int, device: torch.device):
+        # reuse pairs for the whole epoch to stabilize metrics
+        pairs = getattr(self, "_val_pairs", None)
+        if pairs is not None:
+            b_idx, t_idx, tpos, _ = pairs
+            shape_ok = (b_idx.numel() == self.jepa.pairs_per_seq * B) and (t_idx.max().item() < T) and (tpos.max().item() < T)
+            device_ok = (b_idx.device == device)
+            if shape_ok and device_ok:
+                return pairs
 
+        g = torch.Generator(device=device)
+        # fixed seed per epoch for determinism; change base if you want a different stream
+        g.manual_seed(12345 + int(self.current_epoch))
+        self._val_pairs = self.jepa._sample_pairs(B, T, device, generator=g)
+        return self._val_pairs
+    
     def validation_step(self, batch, batch_idx):
         x = batch
         use_jepa = self.jepa_weight > 0.0
@@ -209,8 +229,11 @@ class LitJEPA(L.LightningModule):
             total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
             if use_jepa:
-                # Compute JEPA validation diagnostics with within-horizon negatives
-                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa)  # (N,D), (N,D), (N,)
+                # Fixed pairs per epoch for stable diagnostics
+                B, T = x.shape[0], x.shape[1]
+                pairs = self._get_or_make_val_pairs(B, T, x.device)
+
+                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa, pairs=pairs)  # (N,D), (N,D), (N,)
                 p = torch.nn.functional.normalize(z_pred, dim=-1)
                 y = torch.nn.functional.normalize(z_tgt, dim=-1)
 
@@ -221,9 +244,8 @@ class LitJEPA(L.LightningModule):
                 dimp_sum = 0.0
 
                 for hid in unique_hids:
-                    mask = (k_ids == hid)
-                    n_h = int(mask.sum().item())
                     horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
+                    n_h = int(horizon_idx.numel())
                     if n_h >= 2:
                         p_h = p[horizon_idx]
                         y_h = y[horizon_idx]
@@ -254,7 +276,6 @@ class LitJEPA(L.LightningModule):
                     dist_imposter = d_imp_all.mean()
                     imposter_acc = (d_true_all < d_imp_all).float().mean()
             else:
-                # JEPA disabled: produce benign placeholders
                 imposter_acc = torch.tensor(0.0, device=self.device)
                 dist_true = torch.tensor(0.0, device=self.device)
                 dist_imposter = torch.tensor(0.0, device=self.device)
@@ -282,7 +303,6 @@ class LitJEPA(L.LightningModule):
             self.log("val/std_tgt", zero, on_epoch=True, sync_dist=True)
             self.log("val/std_pred", zero, on_epoch=True, sync_dist=True)
 
-        # Aggregated within-horizon metrics (or zeros if JEPA disabled)
         self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
@@ -397,39 +417,54 @@ class LitJEPA(L.LightningModule):
     def configure_optimizers(self):
         wd = self.optim_cfg.get("weight_decay", 0.1)
         betas = self.optim_cfg.get("betas", (0.9, 0.95))
-        lr_backbone = self.optim_cfg.get("lr", 3e-4)  # backbone LR
+        lr_backbone = self.optim_cfg.get("lr", 3e-4)     # backbone LR
         lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)  # head/embedding LR
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
-        # Parameter partition
-        head_params = list(self.model.token_emb.parameters()) + list(self.model.lm_head.parameters())
-        head_ids = {id(p) for p in head_params}
-        backbone_params = [p for p in self.parameters() if id(p) not in head_ids]
+        # Collect parameter sets
+        emb_params = list(self.model.token_emb.parameters())
+        lm_head_params = list(self.model.lm_head.parameters())
+
+        emb_head_ids = {id(p) for p in emb_params + lm_head_params}
+
+        # Backbone = everything except embedding + lm_head
+        backbone_params = [p for p in self.parameters() if p is not None and p.requires_grad and id(p) not in emb_head_ids]
 
         def split_decay(params):
             decay, no_decay = [], []
             for p in params:
                 if p is None or not p.requires_grad:
                     continue
-                # 1D params (norm scales, biases) -> no weight decay
                 if p.ndim == 1:
-                    no_decay.append(p)
+                    no_decay.append(p)   # biases, norm scales: no decay
                 else:
                     decay.append(p)
             return decay, no_decay
 
-        head_decay, head_no_decay = split_decay(head_params)
         bb_decay, bb_no_decay = split_decay(backbone_params)
 
+        # Embedding + LM head: no decay (often helps perplexity)
+        def uniq(params):
+            seen, out = set(), []
+            for p in params:
+                if p is None or not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid not in seen:
+                    seen.add(pid)
+                    out.append(p)
+            return out
+
+        emb_head_no_decay = uniq(emb_params + lm_head_params)
+
         param_groups = [
-            {"params": head_decay, "lr": lr_head, "weight_decay": wd},
-            {"params": head_no_decay, "lr": lr_head, "weight_decay": 0.0},
+            {"params": emb_head_no_decay, "lr": lr_head, "weight_decay": 0.0},
             {"params": bb_decay, "lr": lr_backbone, "weight_decay": wd},
             {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
         ]
 
         AdamW = torch.optim.AdamW
-        optimizer = AdamW(param_groups, betas=betas)  # lr is per-group now
+        optimizer = AdamW(param_groups, betas=betas)
 
         if self.trainer.max_steps is None:
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
@@ -443,7 +478,7 @@ class LitJEPA(L.LightningModule):
                     "interval": "step",
                     "frequency": 1
                 },
-            }          
+            }
             
     # Per-branch gradient clipping; compatible with Lightning variants (with or without optimizer_idx arg)
     def configure_gradient_clipping(

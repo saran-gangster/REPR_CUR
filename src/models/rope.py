@@ -1,5 +1,4 @@
 import torch
-import math
 
 def build_rope_cache(seq_len: int, head_dim: int, base: float = 10000.0, device=None, dtype=None):
     # Rotary embedding as in RoPE paper

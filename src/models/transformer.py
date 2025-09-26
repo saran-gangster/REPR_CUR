@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -86,9 +86,21 @@ class DecoderBlock(nn.Module):
         return x
 
 class DecoderOnlyTransformer(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 256, n_layers: int = 6, n_heads: int = 8,
-                 dropout: float = 0.1, ff_multiplier: int = 4, use_rope: bool = True, rope_base: float = 10000.0,
-                 weight_tying: bool = True):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        n_layers: int = 6,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        ff_multiplier: int = 4,
+        use_rope: bool = True,
+        rope_base: float = 10000.0,
+        weight_tying: bool = False,  # keep this False to avoid tying to token_emb
+        # NEW:
+        use_lex_bypass: bool = True,
+        tie_head_to_bypass: bool = True,
+    ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -99,15 +111,21 @@ class DecoderOnlyTransformer(nn.Module):
         self.norm_f = RMSNorm(d_model)
         self.n_layers = n_layers
 
-        # LM head (weight tying now optional)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # Store flags so we can re-tie after vocab resize
         self.weight_tying = bool(weight_tying)
+        self.use_lex_bypass = bool(use_lex_bypass)
+        self.tie_head_to_bypass = bool(tie_head_to_bypass)
+
+        # LM head (keep un-tied from token_emb to prevent coupling)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if self.weight_tying:
-            self.lm_head.weight = self.token_emb.weight  
+            # NOTE: we do not want to tie to token_emb anymore in JEPA runs,
+            # but keeping for completeness if used in baselines.
+            self.lm_head.weight = self.token_emb.weight
 
         self.norm_tap = RMSNorm(d_model)
 
-        # LM-only bridge to adapt detached lower features for the upper LM stack
+        # LM-only bridge on the upper stack
         self.lm_bridge = nn.Sequential(
             RMSNorm(d_model),
             nn.Linear(d_model, d_model, bias=True),
@@ -116,6 +134,23 @@ class DecoderOnlyTransformer(nn.Module):
             nn.Linear(d_model, d_model, bias=True),
         )
         self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
+
+        # NEW: LM-only lexical bypass (residual from raw token ids)
+        if self.use_lex_bypass:
+            self.lm_bypass_emb = nn.Embedding(vocab_size, d_model)
+            self.lex_bypass = nn.Sequential(
+                RMSNorm(d_model),
+                nn.Linear(d_model, d_model, bias=False),
+                nn.Dropout(dropout),
+            )
+            self.lex_bypass_gate = nn.Parameter(torch.tensor(-2.0))
+            if self.tie_head_to_bypass:
+                # Weight tying to the LM-only bypass embedding (NOT to token_emb)
+                self.lm_head.weight = self.lm_bypass_emb.weight
+        else:
+            self.lm_bypass_emb = None
+            self.lex_bypass = None
+            self.lex_bypass_gate = None
 
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,
                 grad_barrier: bool = False, tap_norm: bool = False):
@@ -128,38 +163,39 @@ class DecoderOnlyTransformer(nn.Module):
         tap_norm: if True, apply a small RMSNorm at the tap before returning it.
         """
         # idx -> embeddings
-        x = self.token_emb(idx)  # (B, T, C)
+        x = self.token_emb(idx)
         x = self.drop(x)
 
         tap_idx = None
         h_tap = None
         if tap_layer is not None:
-            # normalize negative indexing and clamp into range
             tl = tap_layer if tap_layer >= 0 else self.n_layers + tap_layer
             tl = max(0, min(self.n_layers - 1, tl))
             tap_idx = tl
 
-        # bridge gate (scalar in [0,1])
         g = torch.sigmoid(self.lm_bridge_gate)
 
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if tap_idx is not None and i == tap_idx:
-                # Capture JEPA tap BEFORE any detach/bridge
                 h_tap = x
                 if tap_norm:
                     h_tap = self.norm_tap(h_tap)
-                # Detach the LM path to block gradients flowing into lower layers
                 if grad_barrier:
                     x = x.detach()
-                # Apply gated LM-only bridge after the detach
+
+                # NEW: inject LM-only lexical bypass after the barrier
+                if self.use_lex_bypass and self.lm_bypass_emb is not None:
+                    bp = self.lm_bypass_emb(idx)  # (B,T,C)
+                    x = x + torch.sigmoid(self.lex_bypass_gate) * self.lex_bypass(bp)
+
+                # Existing LM-only bridge
                 x = x + g * self.lm_bridge(x)
 
         h_final = self.norm_f(x)
 
         if return_tap:
             if h_tap is None:
-                # if tap requested but index invalid, fall back to using final pre-norm (rare)
                 h_tap = x
                 if tap_norm:
                     h_tap = self.norm_tap(h_tap)

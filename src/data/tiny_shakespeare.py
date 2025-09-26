@@ -34,11 +34,9 @@ class CharDataset(Dataset):
         self.block_size = block_size
 
     def __len__(self):
-        # number of blocks we can sample (roughly)
         return max(1, len(self.data) // self.block_size)
 
     def __getitem__(self, idx):
-        # sample a random chunk
         start = np.random.randint(0, len(self.data) - self.block_size - 1)
         x = self.data[start : start + self.block_size]
         return torch.tensor(x, dtype=torch.long)

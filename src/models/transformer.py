@@ -99,7 +99,7 @@ class DecoderOnlyTransformer(nn.Module):
         weight_tying: bool = False,  # keep this False to avoid tying to token_emb
         # NEW:
         use_lex_bypass: bool = True,
-        tie_head_to_bypass: bool = True,
+        tie_head_to_bypass: bool = False,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)

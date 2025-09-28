@@ -504,7 +504,7 @@ class LitJEPA(L.LightningModule):
             for p in params:
                 if p is None or not p.requires_grad:
                     continue
-                if p.ndim == 1:  # norms, biases, gates
+                if p.ndim < 2:  # norms, biases, gates
                     no_decay.append(p)
                 else:
                     decay.append(p)

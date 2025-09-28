@@ -98,7 +98,7 @@ class DecoderOnlyTransformer(nn.Module):
         rope_base: float = 10000.0,
         weight_tying: bool = False,  # keep this False to avoid tying to token_emb
         # NEW:
-        use_lex_bypass: bool = True,
+        use_lex_bypass: bool = False,
         tie_head_to_bypass: bool = False,
     ):
         super().__init__()

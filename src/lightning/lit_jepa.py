@@ -93,22 +93,12 @@ class LitJEPA(L.LightningModule):
 
         # Optim config
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
-
-        # NEW: JEPA -> LM world-bias (stop-grad) on logits
-        self.use_world_bias = bool(jepa_cfg.get("use_world_bias", True))
-        self.world_bias_horizon = int(jepa_cfg.get("world_bias_horizon", 1))
-        self.world_bias_stopgrad = bool(jepa_cfg.get("world_bias_stopgrad", True))
-        d_latent = int(jepa_cfg.get("latent_dim", d_model))
-        self.world2logits = nn.Linear(d_latent, vocab_size, bias=False)
-        self.world_bias_gate = nn.Parameter(torch.tensor(-3.0))
         
     def forward(self, x):
         return self.model(x)  # (B, T, C)
 
-    def _lm_loss(self, h: torch.Tensor, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         logits = self.model.lm_head(h[:, :-1, :])            # (B, T-1, V)
-        if bias is not None:
-            logits = logits + bias
         targets = x[:, 1:]                                   # (B, T-1)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
@@ -151,23 +141,7 @@ class LitJEPA(L.LightningModule):
             h_final = self.model(x, tap_layer=None, return_tap=False)
             h_jepa = None
 
-        # World-bias from JEPA predicted latent at horizon k (default k=1)
-        world_bias = None
-        if use_jepa and self.use_world_bias and self.lm_weight_final > 0.0:
-            try:
-                z_pred = self.jepa.predict_k_all(h_jepa, k=self.world_bias_horizon)  # (B, T-k, D)
-                # Align to LM logits length T-1
-                if self.world_bias_horizon <= 1:
-                    z_for_lm = z_pred[:, : h_final.size(1) - 1, :]
-                else:
-                    z_for_lm = z_pred[:, : h_final.size(1) - 1, :]
-                if self.world_bias_stopgrad:
-                    z_for_lm = z_for_lm.detach()
-                world_bias = torch.sigmoid(self.world_bias_gate) * self.world2logits(z_for_lm)  # (B, T-1, V)
-            except Exception:
-                world_bias = None
-
-        lm_loss = self._lm_loss(h_final, x, bias=world_bias) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
+        lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
 
         if use_jepa:
             jepa_out = self.jepa(h_jepa)
@@ -182,10 +156,6 @@ class LitJEPA(L.LightningModule):
         # Logging
         self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=False)
         self.log("train/lm_loss", lm_loss, on_step=True)
-        if self.use_world_bias:
-            self.log("train/world_bias_gate", torch.sigmoid(self.world_bias_gate), on_step=True)
-        if hasattr(self.model, "lex_bypass_gate") and self.model.lex_bypass_gate is not None:
-            self.log("train/lex_bypass_gate", torch.sigmoid(self.model.lex_bypass_gate), on_step=True)
 
         if use_jepa:
             self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
@@ -247,19 +217,7 @@ class LitJEPA(L.LightningModule):
                 h_final = self.model(x, tap_layer=None, return_tap=False)
                 h_jepa = None
 
-            # World-bias (no gradients)
-            world_bias = None
-            if use_jepa and self.use_world_bias and self.lm_weight_final > 0.0:
-                try:
-                    z_pred = self.jepa.predict_k_all(h_jepa, k=self.world_bias_horizon)  # (B, T-k, D)
-                    z_for_lm = z_pred[:, : h_final.size(1) - 1, :]
-                    if self.world_bias_stopgrad:
-                        z_for_lm = z_for_lm.detach()
-                    world_bias = torch.sigmoid(self.world_bias_gate) * self.world2logits(z_for_lm)
-                except Exception:
-                    world_bias = None
-
-            lm_loss = self._lm_loss(h_final, x, bias=world_bias) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
+            lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
             if use_jepa:
                 jepa_out = self.jepa(h_jepa)
                 jepa_loss = jepa_out["loss"]
@@ -325,10 +283,6 @@ class LitJEPA(L.LightningModule):
         # Logs
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
-        if self.use_world_bias:
-            self.log("val/world_bias_gate", torch.sigmoid(self.world_bias_gate), on_epoch=True, sync_dist=True)
-        if hasattr(self.model, "lex_bypass_gate") and self.model.lex_bypass_gate is not None:
-            self.log("val/lex_bypass_gate", torch.sigmoid(self.model.lex_bypass_gate), on_epoch=True, sync_dist=True)
 
         if use_jepa:
             self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
@@ -403,22 +357,11 @@ class LitJEPA(L.LightningModule):
                     tok = nn.Embedding(new_V, d_model).to(device)
                     self.model.token_emb = tok
 
-                    # Recreate bypass embedding if present
-                    if getattr(self.model, "lm_bypass_emb", None) is not None:
-                        self.model.lm_bypass_emb = nn.Embedding(new_V, d_model).to(device)
-
-                    # Recreate LM head and tie as needed
+                    # Recreate LM head and tie as needed (standard weight tying only)
                     head = nn.Linear(d_model, new_V, bias=False).to(device)
-                    if getattr(self.model, "tie_head_to_bypass", False) and getattr(self.model, "lm_bypass_emb", None) is not None:
-                        head.weight = self.model.lm_bypass_emb.weight
-                    elif getattr(self.model, "weight_tying", False):
+                    if getattr(self.model, "weight_tying", False):
                         head.weight = self.model.token_emb.weight
                     self.model.lm_head = head
-
-                    # Recreate world2logits to match vocab
-                    if getattr(self, "world2logits", None) is not None:
-                        in_dim = self.world2logits.in_features
-                        self.world2logits = nn.Linear(in_dim, new_V, bias=False).to(device)
 
                     self.hparams.vocab_size = new_V
         except Exception:
@@ -480,24 +423,13 @@ class LitJEPA(L.LightningModule):
         lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
-        # Head (LM-only) params
-        head_params = []
-        head_params += list(self.model.lm_head.parameters())
-        if getattr(self.model, "lm_bypass_emb", None) is not None:
-            head_params += list(self.model.lm_bypass_emb.parameters())
-        if getattr(self.model, "lex_bypass", None) is not None:
-            head_params += list(self.model.lex_bypass.parameters())
-        if getattr(self.model, "lex_bypass_gate", None) is not None:
-            head_params.append(self.model.lex_bypass_gate)
-        if getattr(self, "world2logits", None) is not None:
-            head_params += list(self.world2logits.parameters())
-        if getattr(self, "world_bias_gate", None) is not None:
-            head_params.append(self.world_bias_gate)
+        head_params = list(self.model.lm_head.parameters())
+        if self.model.weight_tying is False:
+             # If not weight-tying, token_emb is also a head parameter
+             head_params += list(self.model.token_emb.parameters())
 
-        head_ids = {id(p) for p in head_params if p is not None}
-
-        # Backbone = everything else (token_emb, transformer blocks, JEPA, etc.)
-        backbone_params = [p for p in self.parameters() if p is not None and p.requires_grad and id(p) not in head_ids]
+        head_ids = {id(p) for p in head_params}
+        backbone_params = [p for p in self.parameters() if p.requires_grad and id(p) not in head_ids]
 
         def split_decay(params):
             decay, no_decay = [], []
@@ -582,17 +514,6 @@ class LitJEPA(L.LightningModule):
             upper_params += list(self.model.lm_bridge.parameters())
             upper_params += list(self.model.norm_f.parameters())
             upper_params += list(self.model.lm_head.parameters())
-
-            if getattr(self.model, "lm_bypass_emb", None) is not None:
-                upper_params += list(self.model.lm_bypass_emb.parameters())
-            if getattr(self.model, "lex_bypass", None) is not None:
-                upper_params += list(self.model.lex_bypass.parameters())
-            if getattr(self.model, "lex_bypass_gate", None) is not None:
-                upper_params.append(self.model.lex_bypass_gate)
-            if getattr(self, "world2logits", None) is not None:
-                upper_params += list(self.world2logits.parameters())
-            if getattr(self, "world_bias_gate", None) is not None:
-                upper_params.append(self.world_bias_gate)
 
             # JEPA (lower)
             lower_params += list(self.jepa.online_proj.parameters())

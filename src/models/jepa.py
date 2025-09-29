@@ -79,35 +79,6 @@ class JEPAObjective(nn.Module):
         # EMA update for target projector from online projector
         update_ema_(self.target_proj, self.online_proj, self.ema_momentum)
     
-    def _find_k_id(self, k: int):
-        idx = (self.horizon_values == k).nonzero(as_tuple=True)[0]
-        if idx.numel() == 0:
-            return None
-        return int(idx.item())
-
-    def predict_k_all(self, h: torch.Tensor, k: int) -> torch.Tensor:
-        """
-        Predict latent for all valid anchors at horizon k.
-        Returns: z_pred (B, T-k, D)
-        """
-        B, T, C = h.shape
-        assert 1 <= k < T, f"invalid horizon k={k} for T={T}"
-        kid = self._find_k_id(k)
-        if kid is None:
-            raise ValueError(f"horizon k={k} not registered in JEPAObjective.horizons")
-
-        # project anchors
-        h_anchor = h[:, : T - k, :]  # (B, T-k, C)
-        z_anchor = self.online_proj(h_anchor.reshape(-1, C)).view(B, T - k, -1)  # (B, T-k, D)
-
-        # broadcast horizon embedding
-        z_k = self.horizon_emb_latent.weight[kid]  # (D,)
-        z_k = z_k.view(1, 1, -1).expand(B, T - k, -1).contiguous()  # (B, T-k, D)
-
-        # predict
-        z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (B, T-k, D)
-        return z_pred
-    
     def _sample_pairs(self, B: int, T: int, device, generator: torch.Generator | None = None):
         return sample_anchor_target_pairs(
             batch_size=B,

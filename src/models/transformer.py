@@ -96,10 +96,7 @@ class DecoderOnlyTransformer(nn.Module):
         ff_multiplier: int = 4,
         use_rope: bool = True,
         rope_base: float = 10000.0,
-        weight_tying: bool = False,  # keep this False to avoid tying to token_emb
-        # NEW:
-        use_lex_bypass: bool = False,
-        tie_head_to_bypass: bool = False,
+        weight_tying: bool = False,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -111,15 +108,12 @@ class DecoderOnlyTransformer(nn.Module):
         self.norm_f = RMSNorm(d_model)
         self.n_layers = n_layers
 
-        # Store flags so we can re-tie after vocab resize
         self.weight_tying = bool(weight_tying)
-        self.use_lex_bypass = bool(use_lex_bypass)
-        self.tie_head_to_bypass = bool(tie_head_to_bypass)
 
         # LM head (keep un-tied from token_emb to prevent coupling)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if self.weight_tying:
-            # NOTE: we do not want to tie to token_emb anymore in JEPA runs,
+            # NOTE: we do not want to tie to token_emb in JEPA runs,
             # but keeping for completeness if used in baselines.
             self.lm_head.weight = self.token_emb.weight
 
@@ -134,23 +128,6 @@ class DecoderOnlyTransformer(nn.Module):
             nn.Linear(d_model, d_model, bias=True),
         )
         self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
-
-        # NEW: LM-only lexical bypass (residual from raw token ids)
-        if self.use_lex_bypass:
-            self.lm_bypass_emb = nn.Embedding(vocab_size, d_model)
-            self.lex_bypass = nn.Sequential(
-                RMSNorm(d_model),
-                nn.Linear(d_model, d_model, bias=False),
-                nn.Dropout(dropout),
-            )
-            self.lex_bypass_gate = nn.Parameter(torch.tensor(-2.0))
-            if self.tie_head_to_bypass:
-                # Weight tying to the LM-only bypass embedding (NOT to token_emb)
-                self.lm_head.weight = self.lm_bypass_emb.weight
-        else:
-            self.lm_bypass_emb = None
-            self.lex_bypass = None
-            self.lex_bypass_gate = None
 
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,
                 grad_barrier: bool = False, tap_norm: bool = False):
@@ -183,11 +160,6 @@ class DecoderOnlyTransformer(nn.Module):
                     h_tap = self.norm_tap(h_tap)
                 if grad_barrier:
                     x = x.detach()
-
-                # NEW: inject LM-only lexical bypass after the barrier
-                if self.use_lex_bypass and self.lm_bypass_emb is not None:
-                    bp = self.lm_bypass_emb(idx)  # (B,T,C)
-                    x = x + torch.sigmoid(self.lex_bypass_gate) * self.lex_bypass(bp)
 
                 # Existing LM-only bridge
                 x = x + g * self.lm_bridge(x)

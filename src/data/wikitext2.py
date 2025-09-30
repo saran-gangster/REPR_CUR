@@ -119,23 +119,26 @@ class WikiText2DataModule(L.LightningDataModule):
         except Exception as e:
             raise ImportError("Please `pip install datasets` to use WikiText-2.") from e
 
-        # Download dataset (only in rank 0)
-        ds = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=self.hf_cache_dir)
-
-        # Train and save tokenizer once
+        # Train and save tokenizer once using a streaming pass over the train split
         if not os.path.exists(self._hf_bpe_file):
             try:
                 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, normalizers  # type: ignore
             except Exception as e:
                 raise ImportError("Please `pip install tokenizers` to train the HF BPE tokenizer.") from e
 
-            # Build training text file to follow our existing pattern
-            train_texts = ds["train"]["text"]
-            train_texts = [t if t is not None else "" for t in train_texts]
-            train_text = "\n".join(train_texts)
+            # Stream the train split and write lines incrementally to a raw file
             raw_train_file = os.path.join(self.data_dir, "wikitext2_train_raw.txt")
-            with open(raw_train_file, "w", encoding="utf-8") as f:
-                f.write(train_text)
+            if not os.path.exists(raw_train_file):
+                train_iter = datasets.load_dataset(
+                    "wikitext", "wikitext-2-raw-v1", split="train", streaming=True, cache_dir=self.hf_cache_dir
+                )
+                with open(raw_train_file, "w", encoding="utf-8") as f:
+                    for rec in train_iter:
+                        t = rec.get("text", "")
+                        if t is None:
+                            t = ""
+                        f.write(t)
+                        f.write("\n")
 
             # Build BPE tokenizer
             tok = Tokenizer(models.BPE(unk_token="<unk>"))
@@ -154,7 +157,7 @@ class WikiText2DataModule(L.LightningDataModule):
 
             tok.train(files=[raw_train_file], trainer=trainer)
             tok.save(self._hf_bpe_file)
-
+            
     def _load_dataset_splits(self):
         import datasets  # type: ignore
         return datasets.load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=self.hf_cache_dir)
@@ -167,40 +170,54 @@ class WikiText2DataModule(L.LightningDataModule):
             )
         return HFTokenizer(self._hf_bpe_file)
 
-    def _subset_train_texts(self, texts: List[str]) -> List[str]:
-        if self.train_fraction >= 1.0:
-            return texts
-        n = len(texts)
-        k = max(1, int(n * self.train_fraction))
-        rng = np.random.default_rng(self.subset_seed)
-        idx = rng.choice(n, size=k, replace=False)
-        idx.sort()
-        return [texts[i] for i in idx]
-
     def setup(self, stage: Optional[str] = None):
         # Tokenizer
         self.tokenizer = self._build_tokenizer()
         self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
-        # Load dataset splits
-        ds = self._load_dataset_splits()
+        import datasets  # type: ignore
 
-        # Train split (optionally subset for fast prototyping)
-        train_texts = [t if t is not None else "" for t in ds["train"]["text"]]
-        train_texts = self._subset_train_texts(train_texts)
-        train_text = "\n".join(train_texts)
+        # STREAMING train split
+        train_iter = datasets.load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="train", streaming=True, cache_dir=self.hf_cache_dir
+        )
 
-        # Validation split (deterministic windows)
-        val_texts = [t if t is not None else "" for t in ds["validation"]["text"]]
+        # Figure out how many examples to take using the dataset builder (metadata only)
+        try:
+            builder = datasets.load_dataset_builder("wikitext", "wikitext-2-raw-v1", cache_dir=self.hf_cache_dir)
+            total_train_examples = int(builder.info.splits["train"].num_examples)
+        except Exception:
+            total_train_examples = None
+
+        if self.train_fraction >= 1.0 or total_train_examples is None:
+            subset_iter = train_iter
+        else:
+            n_take = max(1, int(total_train_examples * self.train_fraction))
+            # Shuffle for a random subset, then take the fraction
+            subset_iter = train_iter.shuffle(seed=self.subset_seed, buffer_size=10_000).take(n_take)
+
+        # Efficiently build token ids incrementally (avoid a giant in-memory string)
+        train_ids_list: list[int] = []
+        nl_ids = self.tokenizer.encode("\n")
+        for rec in subset_iter:
+            t = rec.get("text", "")
+            if t is None:
+                t = ""
+            ids = self.tokenizer.encode(t)
+            train_ids_list.extend(ids)
+            train_ids_list.extend(nl_ids)  # preserve newline boundaries as in concatenation
+
+        train_ids = np.array(train_ids_list, dtype=np.int32)
+
+        # Non-streaming val/test (small; fine to load normally)
+        ds_full = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", cache_dir=self.hf_cache_dir)
+
+        val_texts = [t if t is not None else "" for t in ds_full["validation"]["text"]]
         val_text = "\n".join(val_texts)
-
-        # Test split (optional; mirrors validation handling)
-        test_texts = [t if t is not None else "" for t in ds.get("test", {"text": []})["text"]]
-        test_text = "\n".join(test_texts)
-
-        # Encode to ids
-        train_ids = np.array(self.tokenizer.encode(train_text), dtype=np.int32)
         val_ids = np.array(self.tokenizer.encode(val_text), dtype=np.int32)
+
+        test_texts = [t if t is not None else "" for t in ds_full.get("test", {"text": []})["text"]]
+        test_text = "\n".join(test_texts)
         test_ids = np.array(self.tokenizer.encode(test_text), dtype=np.int32) if len(test_text) > 0 else np.zeros((1,), dtype=np.int32)
 
         # Datasets

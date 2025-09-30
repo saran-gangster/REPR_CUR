@@ -11,3 +11,5 @@ wandb
 tiktoken
 lightning
 sentencepiece
+datasets
+tokenizers

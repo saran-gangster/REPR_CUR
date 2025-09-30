@@ -63,6 +63,8 @@ class LitJEPA(L.LightningModule):
             gamma_cov=jepa_cfg.get("gamma_cov", 1.0),
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
+            gamma_var_pred=jepa_cfg.get("gamma_var_pred", 0.0),
+            gamma_cov_pred=jepa_cfg.get("gamma_cov_pred", 0.0),
         )
 
         # JEPA/LM weights
@@ -169,6 +171,17 @@ class LitJEPA(L.LightningModule):
                 self.log("train/std_anchor", jepa_out["std_anchor"], on_step=True)
             self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
             self.log("train/num_pairs", jepa_out["num_pairs"], on_step=True)
+            # Optional z_pred regularization diagnostics (only if enabled)
+            if "var_pred" in jepa_out:
+                self.log("train/var_pred", jepa_out["var_pred"], on_step=True)
+            if "cov_pred" in jepa_out:
+                self.log("train/cov_pred", jepa_out["cov_pred"], on_step=True)
+
+            # Per-horizon pair counts
+            for hval in getattr(self.jepa, "horizons", []):
+                key = f"pairs_h{int(hval)}"
+                if key in jepa_out:
+                    self.log(f"train/{key}", jepa_out[key], on_step=True)
         else:
             zero = torch.tensor(0.0, device=self.device)
             self.log("train/jepa_loss", zero, on_step=True)
@@ -181,7 +194,6 @@ class LitJEPA(L.LightningModule):
             self.log("train/num_pairs", zero, on_step=True)
 
         self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
-        self.log("train/ema_momentum", torch.tensor(self.jepa.ema_momentum, device=self.device), on_step=True)
         return total_loss
     
     def on_validation_epoch_start(self):
@@ -219,21 +231,21 @@ class LitJEPA(L.LightningModule):
                 h_jepa = None
 
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
-            if use_jepa:
-                jepa_out = self.jepa(h_jepa)
-                jepa_loss = jepa_out["loss"]
-            else:
-                jepa_out = {}
-                jepa_loss = torch.tensor(0.0, device=self.device)
-
-            eff_lm_w = self._current_lm_weight(self.global_step)
-            total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
             if use_jepa:
-                # Fixed pairs per epoch for stable diagnostics
+                # Fixed pairs per epoch for both JEPA loss and retrieval diagnostics
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
 
+                # JEPA loss on fixed pairs
+                jepa_out = self.jepa(h_jepa, pairs=pairs)
+                jepa_loss = jepa_out["loss"]
+
+                # If you still want a separate random-sampled JEPA loss, uncomment:
+                # jepa_out_rand = self.jepa(h_jepa)
+                # self.log("val/jepa_loss_rand", jepa_out_rand["loss"], on_epoch=True, sync_dist=True)
+
+                # Retrieval metrics on the same fixed pairs
                 z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa, pairs=pairs)
                 p = torch.nn.functional.normalize(z_pred, dim=-1)
                 y = torch.nn.functional.normalize(z_tgt, dim=-1)
@@ -242,44 +254,59 @@ class LitJEPA(L.LightningModule):
                 total_n = 0
                 correct_sum = 0.0
                 dtrue_sum = 0.0
-                dimp_sum = 0.0
+                dneg_sum = 0.0
 
+                # Per-horizon top-1 retrieval within-horizon bucket
                 for hid in unique_hids:
                     horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
                     n_h = int(horizon_idx.numel())
+                    hval = int(self.jepa.horizons[int(hid)])
                     if n_h >= 2:
                         p_h = p[horizon_idx]
                         y_h = y[horizon_idx]
-                        y_imp_h = torch.roll(y_h, shifts=1, dims=0)
+                        sim = p_h @ y_h.T  # (n_h, n_h)
+                        pos_sim = sim.diag()
+                        # max negative (mask diagonal)
+                        sim_neg = sim - torch.eye(n_h, device=sim.device) * 1e9
+                        max_neg_sim, _ = sim_neg.max(dim=1)
 
-                        d_true_h = 1.0 - (p_h * y_h).sum(dim=-1)
-                        d_imp_h = 1.0 - (p_h * y_imp_h).sum(dim=-1)
+                        # top-1 retrieval acc
+                        acc_h = (pos_sim > max_neg_sim).float().mean()
+                        self.log(f"val/top1_acc_h{hval}", acc_h, on_epoch=True, sync_dist=True)
 
-                        acc_h = (d_true_h < d_imp_h).float().mean()
-                        self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", acc_h, on_epoch=True, sync_dist=True)
-
-                        correct_sum += (d_true_h < d_imp_h).float().sum()
-                        dtrue_sum += d_true_h.sum()
-                        dimp_sum += d_imp_h.sum()
+                        correct_sum += (pos_sim > max_neg_sim).float().sum()
+                        dtrue_sum += (1.0 - pos_sim).sum()
+                        dneg_sum += (1.0 - max_neg_sim).sum()
                         total_n += n_h
-                    else:
-                        self.log(f"val/imposter_acc_h{int(self.jepa.horizons[int(hid)])}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
 
-                if total_n >= 2:
+                        # Per-horizon pair count
+                        self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
+                    else:
+                        self.log(f"val/top1_acc_h{hval}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
+                        self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
+
+                if total_n >= 1:
+                    top1_acc = correct_sum / total_n
                     dist_true = dtrue_sum / total_n
-                    dist_imposter = dimp_sum / total_n
-                    imposter_acc = correct_sum / total_n
+                    dist_imposter = dneg_sum / total_n
                 else:
-                    y_imp = torch.roll(y, shifts=1, dims=0)
-                    d_true_all = 1.0 - (p * y).sum(dim=-1)
-                    d_imp_all = 1.0 - (p * y_imp).sum(dim=-1)
-                    dist_true = d_true_all.mean()
-                    dist_imposter = d_imp_all.mean()
-                    imposter_acc = (d_true_all < d_imp_all).float().mean()
+                    # Fallback in degenerate case
+                    sim_all = p @ y.T
+                    pos_sim_all = sim_all.diag()
+                    sim_neg_all = sim_all - torch.eye(sim_all.size(0), device=sim_all.device) * 1e9
+                    max_neg_sim_all, _ = sim_neg_all.max(dim=1)
+                    top1_acc = (pos_sim_all > max_neg_sim_all).float().mean()
+                    dist_true = (1.0 - pos_sim_all).mean()
+                    dist_imposter = (1.0 - max_neg_sim_all).mean()
             else:
-                imposter_acc = torch.tensor(0.0, device=self.device)
+                jepa_out = {}
+                jepa_loss = torch.tensor(0.0, device=self.device)
+                top1_acc = torch.tensor(0.0, device=self.device)
                 dist_true = torch.tensor(0.0, device=self.device)
                 dist_imposter = torch.tensor(0.0, device=self.device)
+
+            eff_lm_w = self._current_lm_weight(self.global_step)
+            total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
         # Logs
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
@@ -291,6 +318,10 @@ class LitJEPA(L.LightningModule):
             self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
             self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
             self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
+            if "var_pred" in jepa_out:
+                self.log("val/var_pred", jepa_out["var_pred"], on_epoch=True, sync_dist=True)
+            if "cov_pred" in jepa_out:
+                self.log("val/cov_pred", jepa_out["cov_pred"], on_epoch=True, sync_dist=True)
             self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
             if "std_anchor" in jepa_out:
                 self.log("val/std_anchor", jepa_out["std_anchor"], on_epoch=True, sync_dist=True)
@@ -305,13 +336,18 @@ class LitJEPA(L.LightningModule):
             self.log("val/std_tgt", zero, on_epoch=True, sync_dist=True)
             self.log("val/std_pred", zero, on_epoch=True, sync_dist=True)
 
-        self.log("val/imposter_acc", imposter_acc, on_epoch=True, sync_dist=True)
+        # Aggregate retrieval metrics (top-1 over in-horizon negatives)
+        self.log("val/top1_acc", top1_acc, on_epoch=True, sync_dist=True)
+        # Backward-compat alias (was "imposter_acc")
+        self.log("val/imposter_acc", top1_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
+
         if self.lm_weight_final > 0.0:
             self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
+
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
-        
+                
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Only update EMA if JEPA is active
         if self.jepa_weight > 0.0:
@@ -320,6 +356,11 @@ class LitJEPA(L.LightningModule):
             except Exception:
                 pass
             self.jepa.momentum_update()
+            # Log the momentum actually used for the EMA update
+            try:
+                self.log("train/ema_momentum", torch.tensor(self.jepa.ema_momentum, device=self.device), on_step=True)
+            except Exception:
+                pass
 
     def on_fit_start(self):
         # Freeze unused modules to avoid DDP unused-param errors
@@ -424,10 +465,14 @@ class LitJEPA(L.LightningModule):
         lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
+        # If JEPA + grad_barrier are active, LM gradients do not reach the embeddings.
+        # In that case, put token_emb in the "backbone" (slow LR) group, not the "head".
+        speaker_owns_embeddings = not (self.jepa_weight > 0.0 and self.jepa_grad_barrier)
+
         head_params = list(self.model.lm_head.parameters())
-        if self.model.weight_tying is False:
-             # If not weight-tying, token_emb is also a head parameter
-             head_params += list(self.model.token_emb.parameters())
+        if self.model.weight_tying is False and speaker_owns_embeddings:
+            # Only add token_emb to the fast "head" group when LM gradients reach it.
+            head_params += list(self.model.token_emb.parameters())
 
         head_ids = {id(p) for p in head_params}
         backbone_params = [p for p in self.parameters() if p.requires_grad and id(p) not in head_ids]
@@ -446,7 +491,7 @@ class LitJEPA(L.LightningModule):
         head_decay, head_no_decay = split_decay(head_params)
         bb_decay, bb_no_decay = split_decay(backbone_params)
 
-        # Common PPL-friendly choice: no decay on heads; decay on backbone
+        # No weight decay on "heads"; decay on backbone
         param_groups = [
             {"params": head_decay + head_no_decay, "lr": lr_head, "weight_decay": 0.0},
             {"params": bb_decay, "lr": lr_backbone, "weight_decay": wd},

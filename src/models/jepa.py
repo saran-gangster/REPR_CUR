@@ -34,6 +34,8 @@ class JEPAObjective(nn.Module):
         gamma_cov: float = 1.0,
         dropout: float = 0.0,
         tau: float = 0.2,
+        gamma_var_pred: float = 0.0,
+        gamma_cov_pred: float = 0.0,
     ):
         super().__init__()
         assert len(horizons) == len(horizon_probs)
@@ -41,6 +43,8 @@ class JEPAObjective(nn.Module):
         self.ema_momentum = ema_momentum
         self.gamma_var = gamma_var
         self.gamma_cov = gamma_cov
+        self.gamma_var_pred = gamma_var_pred
+        self.gamma_cov_pred = gamma_cov_pred
         self.tau = tau
 
         # Register sampling buffers
@@ -90,16 +94,25 @@ class JEPAObjective(nn.Module):
             generator=generator,
         )
 
-    def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
         """
         h: (B, T, C) hidden states from tapped transformer layer
-        Returns dict with loss and diagnostics
+        pairs: optional (b_idx, t_idx, tpos, k_ids). If None, freshly sample pairs.
+        Returns dict with loss and diagnostics.
         """
         B, T, C = h.shape
         device = h.device
 
-        # sample anchor/target pairs
-        b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+        # Use fixed pairs if provided; else sample
+        if pairs is None:
+            b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
+        else:
+            b_idx, t_idx, tpos, k_ids = pairs
+            if b_idx.device != device:
+                b_idx = b_idx.to(device)
+                t_idx = t_idx.to(device)
+                tpos = tpos.to(device)
+                k_ids = k_ids.to(device)
 
         # gather hidden states
         h_anchor = h[b_idx, t_idx, :]           # (N, C)
@@ -142,24 +155,40 @@ class JEPAObjective(nn.Module):
         var_loss = variance_loss(z_anchor)
         cov_loss = covariance_loss(z_anchor)
 
+        # Optional stability regularization on z_pred (especially helpful for long horizons)
+        var_pred = variance_loss(z_pred) if self.gamma_var_pred > 0.0 else torch.tensor(0.0, device=device)
+        cov_pred = covariance_loss(z_pred) if self.gamma_cov_pred > 0.0 else torch.tensor(0.0, device=device)
+
         loss = info_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
+        if self.gamma_var_pred > 0.0:
+            loss = loss + self.gamma_var_pred * var_pred
+        if self.gamma_cov_pred > 0.0:
+            loss = loss + self.gamma_cov_pred * cov_pred
 
         # diagnostics: stds of latents
         std_tgt = z_tgt.std(dim=0, unbiased=False).mean()
         std_anchor = z_anchor.std(dim=0, unbiased=False).mean()
         std_pred = z_pred.std(dim=0, unbiased=False).mean()
 
-        return {
+        # per-horizon pair counts for logging
+        counts = torch.bincount(k_ids, minlength=len(self.horizons)).to(device=device, dtype=z_anchor.dtype)
+
+        out = {
             "loss": loss,
             "info_nce_loss": info_loss.detach(),
             "cos_loss": cos_loss.detach(),
             "var_loss": var_loss.detach(),
             "cov_loss": cov_loss.detach(),
+            "var_pred": var_pred.detach(),
+            "cov_pred": cov_pred.detach(),
             "std_tgt": std_tgt.detach(),
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
             "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float),
         }
+        for i, hval in enumerate(self.horizons):
+            out[f"pairs_h{int(hval)}"] = counts[i]
+        return out
 
     @torch.no_grad()
     def compute_latents(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None):

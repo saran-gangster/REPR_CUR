@@ -4,32 +4,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
-
-# --- Tokenizer wrapper ------------------------------------------------------
-
-class HFTokenizer:
-    def __init__(self, tokenizer_json_path: str):
-        try:
-            from tokenizers import Tokenizer  # type: ignore
-        except Exception as e:
-            raise ImportError("Please `pip install tokenizers` to use the HF BPE tokenizer.") from e
-        self.tk = Tokenizer.from_file(tokenizer_json_path)
-        self.vocab_size = self.tk.get_vocab_size()
-
-    def encode(self, s: str) -> List[int]:
-        return self.tk.encode(s).ids
-
-    def decode(self, ids: List[int]) -> str:
-        try:
-            return self.tk.decode(ids)
-        except Exception:
-            return ""
+from .hf_tokenizer import HFTokenizer
 
 # --- Datasets ---------------------------------------------------------------
 
 class CharDataset(Dataset):
     def __init__(self, data: np.ndarray, block_size: int):
-        self.data = data  # int32 array of token ids
+        self.data = data 
         self.block_size = block_size
 
     def __len__(self):

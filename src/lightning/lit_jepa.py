@@ -73,6 +73,7 @@ class LitJEPA(L.LightningModule):
         self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
         if self.run_baseline:
             self.jepa_weight = 0.0
+            self.lm_weight_final = 1.0
 
         # LM weight scheduling
         self.lm_weight_use_scheduler = bool(jepa_cfg.get("lm_weight_use_scheduler", not self.run_baseline))

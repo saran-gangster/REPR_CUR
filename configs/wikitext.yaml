@@ -1,63 +1,52 @@
 seed_everything: 52
 
 trainer:
-  max_steps: 30000
+  max_steps: 10000
   log_every_n_steps: 50
-  val_check_interval: 1000
+  # val_check_interval: 62
+  check_val_every_n_epoch: 3
   gradient_clip_val: 1.0
   precision: bf16-mixed
 
 model:
-  # Model size scaled up slightly for WikiText-2
-  vocab_size: 8192  # Will be overridden by DataModule
-  d_model: 512
-  n_layers: 8
-  n_heads: 8
-  dropout: 0.1
-  ff_multiplier: 4
-  use_rope: true
-  rope_base: 10000
-  weight_tying: false
-
-  jepa:
-    latent_dim: 512
-
-    # H3: Mixed Short & Long Range (Hypothesis: Best PPL)
-    horizons: [4, 16, 64, 128]
-    horizon_probs: [0.4, 0.3, 0.2, 0.1]
-
-    ema_momentum: 0.996
-    gamma_var: 1.0
-    gamma_cov: 1.0
-    tau: 0.1
-    tap_layer: -3
-    tap_norm: true
-    grad_barrier: true
-
-    jepa_weight: 1.0
-    lm_weight: 0.75
-    lm_weight_use_scheduler: false  # keep constant LM weight unless you want a ramp
-
-optimizer:
-  # Differential learning rates (validated recipe)
-  lr: 2.0e-4       # Backbone
-  lr_head: 2.0e-4  # Head/Embeddings
-  weight_decay: 0.1
-  betas: [0.9, 0.95]
-  warmup_steps: 1500
+    vocab_size: 8192
+    d_model: 512
+    n_layers: 8
+    n_heads: 8
+    dropout: 0.1
+    ff_multiplier: 4
+    use_rope: true
+    rope_base: 10000
+    weight_tying: false
+    
+    jepa:
+          latent_dim: 512
+          horizons: [4, 16, 64, 128]
+          horizon_probs: [0.4, 0.3, 0.2, 0.1]
+          ema_momentum: 0.996
+          gamma_var: 1.0
+          gamma_cov: 1.0
+          tau: 0.1
+          tap_layer: -3
+          tap_norm: true
+          grad_barrier: true
+          jepa_weight: 1.0
+          lm_weight: 0.75
+          lm_weight_use_scheduler: false
+        
+    optimizer:
+          lr: 2.0e-4
+          lr_head: 2.0e-4
+          weight_decay: 0.1
+          betas: [0.9, 0.95]
+          warmup_steps: 1500
 
 data:
-  class_path: src.data.wikitext2.WikiText2DataModule
-  init_args:
-    data_dir: data/wikitext2/
-    block_size: 512
-    batch_size: 16
-    num_workers: 4
-
-    # Fast prototyping
-    train_fraction: 0.2
-    subset_seed: 1234
-
-    # BPE settings
-    bpe_vocab_size: 8192
-    bpe_lowercase: true
+  data_dir: data/wikitext2/
+  block_size: 512
+  batch_size: 16
+  num_workers: 4
+  train_fraction: 0.2
+  subset_seed: 1234
+  bpe_vocab_size: 8192
+  bpe_lowercase: true

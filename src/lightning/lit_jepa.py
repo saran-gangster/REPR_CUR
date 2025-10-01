@@ -182,6 +182,8 @@ class LitJEPA(L.LightningModule):
                 key = f"pairs_h{int(hval)}"
                 if key in jepa_out:
                     self.log(f"train/{key}", jepa_out[key], on_step=True)
+            g = torch.sigmoid(self.model.lm_bridge_gate)
+            self.log("train/bridge_gate", g, on_step=True)
         else:
             zero = torch.tensor(0.0, device=self.device)
             self.log("train/jepa_loss", zero, on_step=True)
@@ -192,13 +194,12 @@ class LitJEPA(L.LightningModule):
             self.log("train/std_tgt", zero, on_step=True)
             self.log("train/std_pred", zero, on_step=True)
             self.log("train/num_pairs", zero, on_step=True)
-
+        
         self.log("train/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_step=True)
         return total_loss
     
     def on_validation_epoch_start(self):
-        # reset fixed sampling per epoch for deterministic JEPA validation
-        self._val_pairs = None
+        pass
     
     def _get_or_make_val_pairs(self, B: int, T: int, device: torch.device):
         # reuse pairs for the whole epoch to stabilize metrics
@@ -212,7 +213,7 @@ class LitJEPA(L.LightningModule):
 
         g = torch.Generator(device=device)
         # fixed seed per epoch for determinism; change base if you want a different stream
-        g.manual_seed(12345 + int(self.current_epoch))
+        g.manual_seed(12345)
         self._val_pairs = self.jepa._sample_pairs(B, T, device, generator=g)
         return self._val_pairs
     
@@ -233,121 +234,68 @@ class LitJEPA(L.LightningModule):
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
 
             if use_jepa:
-                # Fixed pairs per epoch for both JEPA loss and retrieval diagnostics
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
-
-                # JEPA loss on fixed pairs
                 jepa_out = self.jepa(h_jepa, pairs=pairs)
                 jepa_loss = jepa_out["loss"]
+                b_idx, _, tpos, _ = pairs
+                h_target = h_jepa[b_idx, tpos, :]
+                z_teacher = self.jepa.target_proj(h_target)
+                z_online_tgt = self.jepa.online_proj(h_target)
+                align = F.cosine_similarity(z_online_tgt, z_teacher, dim=-1).mean()
+                self.log("val/teacher_online_align", align, on_epoch=True, sync_dist=True)
 
-                # If you still want a separate random-sampled JEPA loss, uncomment:
-                # jepa_out_rand = self.jepa(h_jepa)
-                # self.log("val/jepa_loss_rand", jepa_out_rand["loss"], on_epoch=True, sync_dist=True)
-
-                # Retrieval metrics on the same fixed pairs
                 z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa, pairs=pairs)
                 p = torch.nn.functional.normalize(z_pred, dim=-1)
                 y = torch.nn.functional.normalize(z_tgt, dim=-1)
-
                 unique_hids = torch.unique(k_ids)
-                total_n = 0
-                correct_sum = 0.0
-                dtrue_sum = 0.0
-                dneg_sum = 0.0
+                total_n, correct_sum, dtrue_sum, dneg_sum = 0, 0.0, 0.0, 0.0
 
-                # Per-horizon top-1 retrieval within-horizon bucket
                 for hid in unique_hids:
                     horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
                     n_h = int(horizon_idx.numel())
                     hval = int(self.jepa.horizons[int(hid)])
                     if n_h >= 2:
-                        p_h = p[horizon_idx]
-                        y_h = y[horizon_idx]
-                        sim = p_h @ y_h.T  # (n_h, n_h)
+                        p_h, y_h = p[horizon_idx], y[horizon_idx]
+                        sim = p_h @ y_h.T
                         pos_sim = sim.diag()
-                        # max negative (mask diagonal)
-                        sim_neg = sim - torch.eye(n_h, device=sim.device) * 1e9
-                        max_neg_sim, _ = sim_neg.max(dim=1)
-
-                        # top-1 retrieval acc
+                        sim.fill_diagonal_(-torch.inf)
+                        max_neg_sim, _ = sim.max(dim=1)
                         acc_h = (pos_sim > max_neg_sim).float().mean()
                         self.log(f"val/top1_acc_h{hval}", acc_h, on_epoch=True, sync_dist=True)
-
                         correct_sum += (pos_sim > max_neg_sim).float().sum()
                         dtrue_sum += (1.0 - pos_sim).sum()
                         dneg_sum += (1.0 - max_neg_sim).sum()
                         total_n += n_h
-
-                        # Per-horizon pair count
                         self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
                     else:
                         self.log(f"val/top1_acc_h{hval}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
                         self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
 
                 if total_n >= 1:
-                    top1_acc = correct_sum / total_n
-                    dist_true = dtrue_sum / total_n
-                    dist_imposter = dneg_sum / total_n
+                    top1_acc, dist_true, dist_imposter = correct_sum / total_n, dtrue_sum / total_n, dneg_sum / total_n
                 else:
-                    # Fallback in degenerate case
-                    sim_all = p @ y.T
-                    pos_sim_all = sim_all.diag()
-                    sim_neg_all = sim_all - torch.eye(sim_all.size(0), device=sim_all.device) * 1e9
-                    max_neg_sim_all, _ = sim_neg_all.max(dim=1)
-                    top1_acc = (pos_sim_all > max_neg_sim_all).float().mean()
-                    dist_true = (1.0 - pos_sim_all).mean()
-                    dist_imposter = (1.0 - max_neg_sim_all).mean()
+                    top1_acc, dist_true, dist_imposter = torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device), torch.tensor(1.0, device=self.device)
             else:
-                jepa_out = {}
-                jepa_loss = torch.tensor(0.0, device=self.device)
-                top1_acc = torch.tensor(0.0, device=self.device)
-                dist_true = torch.tensor(0.0, device=self.device)
-                dist_imposter = torch.tensor(0.0, device=self.device)
+                jepa_out, jepa_loss = {}, torch.tensor(0.0, device=self.device)
+                top1_acc, dist_true, dist_imposter = torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device), torch.tensor(1.0, device=self.device)
 
             eff_lm_w = self._current_lm_weight(self.global_step)
             total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
-        # Logs
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
-
         if use_jepa:
-            self.log("val/jepa_loss", jepa_out["loss"], on_epoch=True, sync_dist=True)
-            self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
-            self.log("val/cos_loss", jepa_out["cos_loss"], on_epoch=True, sync_dist=True)
-            self.log("val/var_loss", jepa_out["var_loss"], on_epoch=True, sync_dist=True)
-            self.log("val/cov_loss", jepa_out["cov_loss"], on_epoch=True, sync_dist=True)
-            if "var_pred" in jepa_out:
-                self.log("val/var_pred", jepa_out["var_pred"], on_epoch=True, sync_dist=True)
-            if "cov_pred" in jepa_out:
-                self.log("val/cov_pred", jepa_out["cov_pred"], on_epoch=True, sync_dist=True)
-            self.log("val/std_tgt", jepa_out["std_tgt"], on_epoch=True, sync_dist=True)
-            if "std_anchor" in jepa_out:
-                self.log("val/std_anchor", jepa_out["std_anchor"], on_epoch=True, sync_dist=True)
-            self.log("val/std_pred", jepa_out["std_pred"], on_epoch=True, sync_dist=True)
-        else:
-            zero = torch.tensor(0.0, device=self.device)
-            self.log("val/jepa_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/info_nce_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/cos_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/var_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/cov_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/std_tgt", zero, on_epoch=True, sync_dist=True)
-            self.log("val/std_pred", zero, on_epoch=True, sync_dist=True)
-
-        # Aggregate retrieval metrics (top-1 over in-horizon negatives)
+            for k, v in jepa_out.items():
+                if k != "loss": self.log(f"val/{k}", v, on_epoch=True, sync_dist=True)
+            self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)
         self.log("val/top1_acc", top1_acc, on_epoch=True, sync_dist=True)
-        # Backward-compat alias (was "imposter_acc")
         self.log("val/imposter_acc", top1_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
-
-        if self.lm_weight_final > 0.0:
-            self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
-
+        if self.lm_weight_final > 0.0: self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
-                
+                        
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Only update EMA if JEPA is active
         if self.jepa_weight > 0.0:

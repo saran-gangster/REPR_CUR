@@ -167,6 +167,9 @@ class LitJEPA(L.LightningModule):
             self.log("train/var_loss", jepa_out["var_loss"], on_step=True)
             self.log("train/cov_loss", jepa_out["cov_loss"], on_step=True)
             self.log("train/std_tgt", jepa_out["std_tgt"], on_step=True)
+            self.log("train/top1_forward", jepa_out.get("top1_forward", torch.tensor(float("nan"), device=self.device)), on_step=True)
+            self.log("train/pos_logit_mean", jepa_out.get("pos_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
+            self.log("train/maxneg_logit_mean", jepa_out.get("maxneg_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
             if "std_anchor" in jepa_out:
                 self.log("train/std_anchor", jepa_out["std_anchor"], on_step=True)
             self.log("train/std_pred", jepa_out["std_pred"], on_step=True)
@@ -237,9 +240,11 @@ class LitJEPA(L.LightningModule):
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
                 jepa_out = self.jepa(h_jepa, pairs=pairs)
-                self.log("train/top1_forward", jepa_out.get("top1_forward", torch.tensor(float("nan"), device=self.device)), on_step=True)
-                self.log("train/pos_logit_mean", jepa_out.get("pos_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
-                self.log("train/maxneg_logit_mean", jepa_out.get("maxneg_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
+
+                # Log the internal top-1 computed inside JEPA.forward (same logits)
+                self.log("val/top1_forward", jepa_out.get("top1_forward", torch.tensor(float("nan"), device=self.device)),
+                        on_epoch=True, sync_dist=True)
+
                 jepa_loss = jepa_out["loss"]
                 b_idx, _, tpos, _ = pairs
                 h_target = h_jepa[b_idx, tpos, :]
@@ -248,11 +253,17 @@ class LitJEPA(L.LightningModule):
                 align = F.cosine_similarity(z_online_tgt, z_teacher, dim=-1).mean()
                 self.log("val/teacher_online_align", align, on_epoch=True, sync_dist=True)
 
+                # Compute latents and per-horizon metrics (external top-1)
                 z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa, pairs=pairs)
                 p = torch.nn.functional.normalize(z_pred, dim=-1)
                 y = torch.nn.functional.normalize(z_tgt, dim=-1)
                 unique_hids = torch.unique(k_ids)
                 total_n, correct_sum, dtrue_sum, dneg_sum = 0, 0.0, 0.0, 0.0
+
+                # Aggregators for chance & normalized top1 (weighted by n_h)
+                weighted_chance_sum = 0.0
+                weighted_norm_sum = 0.0
+                count_sum = 0
 
                 for hid in unique_hids:
                     horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
@@ -262,42 +273,89 @@ class LitJEPA(L.LightningModule):
                         p_h, y_h = p[horizon_idx], y[horizon_idx]
                         sim = p_h @ y_h.T
                         pos_sim = sim.diag()
-                        sim.fill_diagonal_(-torch.inf)
-                        max_neg_sim, _ = sim.max(dim=1)
+
+                        # create sim_neg robustly avoiding in-place ops
+                        sim_neg = sim.clone()
+                        sim_neg.fill_diagonal_(-float("inf"))
+                        max_neg_sim, _ = sim_neg.max(dim=1)
+
                         acc_h = (pos_sim > max_neg_sim).float().mean()
                         self.log(f"val/top1_acc_h{hval}", acc_h, on_epoch=True, sync_dist=True)
+
+                        # Chance baseline and normalized top-1
+                        chance_h = 1.0 / float(n_h)
+                        norm_top1_h = (acc_h - chance_h) / max(1.0 - chance_h, 1e-8)
+
+                        # Log per-horizon values
+                        self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
+                        self.log(f"val/chance_h{hval}", torch.tensor(chance_h, device=self.device), on_epoch=True, sync_dist=True)
+                        self.log(f"val/norm_top1_h{hval}", norm_top1_h, on_epoch=True, sync_dist=True)
+
+                        # Aggregate (weighted by n_h)
+                        weighted_chance_sum += chance_h * n_h
+                        weighted_norm_sum += norm_top1_h * n_h
+                        count_sum += n_h
+
+                        # Existing accumulators for external top-1 and distances
                         correct_sum += (pos_sim > max_neg_sim).float().sum()
                         dtrue_sum += (1.0 - pos_sim).sum()
                         dneg_sum += (1.0 - max_neg_sim).sum()
                         total_n += n_h
-                        self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
                     else:
+                        # Keep existing NaN logs if degenerate
                         self.log(f"val/top1_acc_h{hval}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
                         self.log(f"val/pairs_h{hval}", torch.tensor(float(n_h), device=self.device), on_epoch=True, sync_dist=True)
+                        self.log(f"val/chance_h{hval}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
+                        self.log(f"val/norm_top1_h{hval}", torch.tensor(float('nan'), device=self.device), on_epoch=True, sync_dist=True)
 
                 if total_n >= 1:
-                    top1_acc, dist_true, dist_imposter = correct_sum / total_n, dtrue_sum / total_n, dneg_sum / total_n
+                    top1_acc = correct_sum / total_n
+                    dist_true = dtrue_sum / total_n
+                    dist_imposter = dneg_sum / total_n
                 else:
-                    top1_acc, dist_true, dist_imposter = torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device), torch.tensor(1.0, device=self.device)
+                    top1_acc = torch.tensor(0.0, device=self.device)
+                    dist_true = torch.tensor(1.0, device=self.device)
+                    dist_imposter = torch.tensor(1.0, device=self.device)
+
+                # After computing external top1, compute gap vs internal (forward) top1
+                try:
+                    top1_forward = jepa_out.get("top1_forward", torch.tensor(float("nan"), device=self.device))
+                    gap = torch.abs(top1_forward.detach() - top1_acc.detach())
+                except Exception:
+                    gap = torch.tensor(float("nan"), device=self.device)
+                self.log("val/top1_gap", gap, on_epoch=True, sync_dist=True)
+
+                # Global chance and normalized top-1 (weighted across horizons)
+                if count_sum > 0:
+                    self.log("val/chance", torch.tensor(weighted_chance_sum / count_sum, device=self.device),
+                            on_epoch=True, sync_dist=True)
+                    self.log("val/norm_top1", torch.tensor(weighted_norm_sum / count_sum, device=self.device),
+                            on_epoch=True, sync_dist=True)
             else:
                 jepa_out, jepa_loss = {}, torch.tensor(0.0, device=self.device)
-                top1_acc, dist_true, dist_imposter = torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device), torch.tensor(1.0, device=self.device)
+                top1_acc = torch.tensor(0.0, device=self.device)
+                dist_true = torch.tensor(1.0, device=self.device)
+                dist_imposter = torch.tensor(1.0, device=self.device)
 
             eff_lm_w = self._current_lm_weight(self.global_step)
             total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
+        # Final validation logs (keep existing behavior)
         self.log("val/total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
         if use_jepa:
             for k, v in jepa_out.items():
-                if k != "loss": self.log(f"val/{k}", v, on_epoch=True, sync_dist=True)
+                if k != "loss":
+                    self.log(f"val/{k}", v, on_epoch=True, sync_dist=True)
             self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)
         self.log("val/top1_acc", top1_acc, on_epoch=True, sync_dist=True)
         self.log("val/imposter_acc", top1_acc, on_epoch=True, sync_dist=True)
         self.log("val/dist_true", dist_true, on_epoch=True, sync_dist=True)
         self.log("val/dist_imposter", dist_imposter, on_epoch=True, sync_dist=True)
-        if self.lm_weight_final > 0.0: self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
+        if self.lm_weight_final > 0.0:
+            self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
         self.log("val/lm_weight", torch.tensor(eff_lm_w, device=self.device), on_epoch=True, sync_dist=True)
+
                         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Only update EMA if JEPA is active

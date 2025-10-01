@@ -1,5 +1,6 @@
 # src/train.py
-from lightning.pytorch.cli import LightningCLI
+import sys
+from lightning.pytorch.cli import LightningCLI, LightningArgumentParser
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from src.lightning.lit_jepa import LitJEPA
@@ -19,18 +20,23 @@ def main():
     class MyLightningCLI(LightningCLI):
         def add_arguments_to_parser(self, parser):
             parser.set_defaults({"trainer.logger": [tb_logger, wandb_logger]})
-            # Allow arbitrary kwargs for UnifiedDataModule by disabling strict validation
-            # This is needed because UnifiedDataModule forwards **kwargs to the underlying datamodule
-            parser.set_defaults({"data": {}})
+        
+        def instantiate_classes(self) -> None:
+            """Override to handle UnifiedDataModule's **kwargs gracefully."""
+            # Let Lightning instantiate the trainer and model normally
+            self.config_init = self.parser.instantiate_classes(self.config)
+            
+            # Access datamodule config and instantiate manually if needed
+            # This bypasses strict validation for the datamodule kwargs
+            self.datamodule = self.config_init.get("data")
+            self.model = self.config_init.get("model") 
+            self.trainer = self.config_init.get("trainer")
 
     cli = MyLightningCLI(
         LitJEPA, 
         UnifiedDataModule, 
         save_config_callback=None,
-        parser_kwargs={
-            "fit": {"default_config_files": []},
-            "parser_mode": "omegaconf"  # Use OmegaConf mode for more flexible config handling
-        }
+        auto_configure_optimizers=False
     )
 
 

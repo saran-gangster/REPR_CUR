@@ -237,6 +237,9 @@ class LitJEPA(L.LightningModule):
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
                 jepa_out = self.jepa(h_jepa, pairs=pairs)
+                self.log("train/top1_forward", jepa_out.get("top1_forward", torch.tensor(float("nan"), device=self.device)), on_step=True)
+                self.log("train/pos_logit_mean", jepa_out.get("pos_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
+                self.log("train/maxneg_logit_mean", jepa_out.get("maxneg_logit_mean", torch.tensor(float("nan"), device=self.device)), on_step=True)
                 jepa_loss = jepa_out["loss"]
                 b_idx, _, tpos, _ = pairs
                 h_target = h_jepa[b_idx, tpos, :]

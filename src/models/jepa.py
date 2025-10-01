@@ -137,15 +137,36 @@ class JEPAObjective(nn.Module):
         unique_hids = torch.unique(k_ids)
         total_n = p.size(0)
         info_loss = torch.zeros((), device=device)
+
+        # Internal top-1 retrieval computed on the SAME logits used for CE
+        correct_sum = 0.0
+        pos_logit_sum = 0.0
+        maxneg_logit_sum = 0.0
+        total_rows = 0
+
         for hid in unique_hids:
             idx = (k_ids == hid).nonzero(as_tuple=True)[0]
             n = idx.numel()
             if n == 0:
                 continue
+
             sim = (p[idx] @ y[idx].T) / tau  # (n, n)
+
+            # InfoNCE with diagonal as positives
             target = torch.arange(n, device=device)
             loss_h = F.cross_entropy(sim, target)
             info_loss = info_loss + loss_h * (n / max(1, total_n))
+
+            # Internal top-1 retrieval on same logits
+            if n >= 2:
+                pos_sim = sim.diag()  # (n,)
+                sim_neg = sim - torch.eye(n, device=sim.device, dtype=sim.dtype) * 1e9
+                max_neg_sim, _ = sim_neg.max(dim=1)  # (n,)
+
+                correct_sum += (pos_sim > max_neg_sim).float().sum().item()
+                pos_logit_sum += pos_sim.float().sum().item()
+                maxneg_logit_sum += max_neg_sim.float().sum().item()
+                total_rows += n
 
         # diagnostics: cosine distance (not optimized)
         cos_loss = 1.0 - (p * y).sum(dim=-1)
@@ -173,6 +194,16 @@ class JEPAObjective(nn.Module):
         # per-horizon pair counts for logging
         counts = torch.bincount(k_ids, minlength=len(self.horizons)).to(device=device, dtype=z_anchor.dtype)
 
+        # Internal top-1 metrics (on same logits). Chance ≈ 1/n per horizon when random.
+        if total_rows > 0:
+            top1_forward = torch.tensor(correct_sum / float(total_rows), device=device)
+            pos_logit_mean = torch.tensor(pos_logit_sum / float(total_rows), device=device)
+            maxneg_logit_mean = torch.tensor(maxneg_logit_sum / float(total_rows), device=device)
+        else:
+            top1_forward = torch.tensor(float("nan"), device=device)
+            pos_logit_mean = torch.tensor(float("nan"), device=device)
+            maxneg_logit_mean = torch.tensor(float("nan"), device=device)
+
         out = {
             "loss": loss,
             "info_nce_loss": info_loss.detach(),
@@ -184,6 +215,9 @@ class JEPAObjective(nn.Module):
             "std_tgt": std_tgt.detach(),
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
+            "top1_forward": top1_forward.detach(),
+            "pos_logit_mean": pos_logit_mean.detach(),
+            "maxneg_logit_mean": maxneg_logit_mean.detach(),
             "num_pairs": torch.tensor(h_anchor.shape[0], device=device, dtype=torch.float),
         }
         for i, hval in enumerate(self.horizons):

@@ -26,7 +26,7 @@ model:
     gamma_var: 1.0
     gamma_cov: 1.0
     tau: 0.1
-    tap_layer: -3
+    tap_layer: -4
     tap_norm: true
     grad_barrier: true
     jepa_weight: 1.0

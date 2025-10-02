@@ -20,7 +20,7 @@ model:
 
   jepa:
     latent_dim: 512
-    horizons: [4, 16, 64, 128]
+    horizons: [2, 8, 32, 64]
     horizon_probs: [0.4, 0.3, 0.2, 0.1]
     ema_momentum: 0.996
     gamma_var: 1.0
@@ -34,8 +34,8 @@ model:
     lm_weight_use_scheduler: false
 
   optimizer:
-    lr: 2.0e-4
-    lr_head: 2.0e-4
+    lr: 1.0e-4
+    lr_head: 1.0e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 1500

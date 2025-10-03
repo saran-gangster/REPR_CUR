@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .norms import RMSNorm
 from .rope import build_rope_cache, apply_rope
+import math
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_mult: int = 4, dropout: float = 0.0):
@@ -110,13 +111,14 @@ class DecoderOnlyTransformer(nn.Module):
 
         self.weight_tying = bool(weight_tying)
 
-        # LM head (keep un-tied from token_emb to prevent coupling)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if self.weight_tying:
-            # NOTE: we do not want to tie to token_emb in JEPA runs,
-            # but keeping for completeness if used in baselines.
+            # tie weights
             self.lm_head.weight = self.token_emb.weight
 
+        # Tied softmax stabilizers: learnable temperature + output bias
+        self.logit_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(d_model))) if self.weight_tying else None
+        self.output_bias = nn.Parameter(torch.zeros(vocab_size)) if self.weight_tying else None
         self.norm_tap = RMSNorm(d_model)
 
         # LM-only bridge on the upper stack

@@ -96,16 +96,22 @@ class LitJEPA(L.LightningModule):
 
         # Optim config
         self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
-        
-    def forward(self, x):
-        return self.model(x)  # (B, T, C)
     
     def _lm_logits(self, h: torch.Tensor) -> torch.Tensor:
+        # Base logits
         logits = self.model.lm_head(h)
-        # Stabilize tied softmax: scale logits by 1/sqrt(d_model)
+        # If tied, apply learnable temperature and output bias
         if getattr(self.model, "weight_tying", False):
-            logits = logits * (h.shape[-1] ** -0.5)
+            ls = getattr(self.model, "logit_scale", None)
+            if ls is not None:
+                logits = logits * ls
+            b = getattr(self.model, "output_bias", None)
+            if b is not None:
+                logits = logits + b
         return logits
+    
+    def forward(self, x):
+        return self.model(x)  # (B, T, C)
 
     def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         logits = self._lm_logits(h[:, :-1, :])               # (B, T-1, V)
@@ -338,13 +344,23 @@ class LitJEPA(L.LightningModule):
                     tok = nn.Embedding(new_V, d_model).to(device)
                     self.model.token_emb = tok
 
-                    # Recreate LM head and tie as needed (standard weight tying only)
+                    # Recreate LM head and tie as needed
                     head = nn.Linear(d_model, new_V, bias=False).to(device)
                     if getattr(self.model, "weight_tying", False):
                         head.weight = self.model.token_emb.weight
                     self.model.lm_head = head
 
+                    # Rebuild tied softmax extras
+                    if getattr(self.model, "weight_tying", False):
+                        import math
+                        self.model.logit_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(d_model), device=device))
+                        self.model.output_bias = nn.Parameter(torch.zeros(new_V, device=device))
+                    else:
+                        self.model.logit_scale = None
+                        self.model.output_bias = None
+
                     self.hparams.vocab_size = new_V
+                    
         except Exception:
             pass
 
@@ -411,11 +427,17 @@ class LitJEPA(L.LightningModule):
         head_params = []
         head_ids = set()
         
-        if self.model.weight_tying:
-            # With weight tying, lm_head.weight IS token_emb.weight
-            # Only add it once to the head group (since LM loss always trains it)
-            head_params = list(self.model.lm_head.parameters())
-            head_ids = {id(p) for p in head_params}
+        # If tied, also treat logit scale and output bias as head params
+        if getattr(self.model, "weight_tying", False):
+            extra_head = []
+            ls = getattr(self.model, "logit_scale", None)
+            if ls is not None:
+                extra_head.append(ls)
+            ob = getattr(self.model, "output_bias", None)
+            if ob is not None:
+                extra_head.append(ob)
+            head_params += extra_head
+            head_ids.update({id(p) for p in extra_head})
         else:
             # Without weight tying, they're separate parameters
             head_params = list(self.model.lm_head.parameters())

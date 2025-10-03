@@ -397,16 +397,27 @@ class LitJEPA(L.LightningModule):
         lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
-        # If JEPA + grad_barrier are active, LM gradients do not reach the embeddings.
-        # In that case, put token_emb in the "backbone" (slow LR) group, not the "head".
+        # Determine if LM gradients reach the embeddings
         speaker_owns_embeddings = not (self.jepa_weight > 0.0 and self.jepa_grad_barrier)
 
-        head_params = list(self.model.lm_head.parameters())
-        if self.model.weight_tying is False and speaker_owns_embeddings:
-            # Only add token_emb to the fast "head" group when LM gradients reach it.
-            head_params += list(self.model.token_emb.parameters())
+        # Collect head parameters
+        head_params = []
+        head_ids = set()
+        
+        if self.model.weight_tying:
+            # With weight tying, lm_head.weight IS token_emb.weight
+            # Only add it once to the head group (since LM loss always trains it)
+            head_params = list(self.model.lm_head.parameters())
+            head_ids = {id(p) for p in head_params}
+        else:
+            # Without weight tying, they're separate parameters
+            head_params = list(self.model.lm_head.parameters())
+            if speaker_owns_embeddings:
+                # LM gradients reach embeddings, so train embeddings with fast LR
+                head_params += list(self.model.token_emb.parameters())
+            head_ids = {id(p) for p in head_params}
 
-        head_ids = {id(p) for p in head_params}
+        # Backbone: everything else that requires grad and isn't in head_ids
         backbone_params = [p for p in self.parameters() if p.requires_grad and id(p) not in head_ids]
 
         def split_decay(params):

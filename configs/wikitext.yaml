@@ -46,7 +46,7 @@ data:
   block_size: 512
   batch_size: 16
   num_workers: 4
-  train_fraction: 0.2
+  train_fraction: 0.5
   subset_seed: 1234
   bpe_vocab_size: 8192
   bpe_lowercase: true

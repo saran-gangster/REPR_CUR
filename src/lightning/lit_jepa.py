@@ -99,9 +99,16 @@ class LitJEPA(L.LightningModule):
         
     def forward(self, x):
         return self.model(x)  # (B, T, C)
+    
+    def _lm_logits(self, h: torch.Tensor) -> torch.Tensor:
+        logits = self.model.lm_head(h)
+        # Stabilize tied softmax: scale logits by 1/sqrt(d_model)
+        if getattr(self.model, "weight_tying", False):
+            logits = logits * (h.shape[-1] ** -0.5)
+        return logits
 
     def _lm_loss(self, h: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        logits = self.model.lm_head(h[:, :-1, :])            # (B, T-1, V)
+        logits = self._lm_logits(h[:, :-1, :])               # (B, T-1, V)
         targets = x[:, 1:]                                   # (B, T-1)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),

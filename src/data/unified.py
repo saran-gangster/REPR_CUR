@@ -1,4 +1,3 @@
-# src/data/unified.py
 from __future__ import annotations
 from typing import Any, Dict, Optional
 import lightning as L
@@ -120,7 +119,6 @@ class UnifiedDataModule(L.LightningDataModule):
             return self._dm.test_dataloader()
         return None
 
-    # Nice to have: readable repr
     def __repr__(self) -> str:
         cls = type(self).__name__
         return f"{cls}(module={self._module_id!r}, kwargs={list(self._dm_kwargs.keys())})"

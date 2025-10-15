@@ -55,26 +55,48 @@ class LitJEPA(L.LightningModule):
             d_model=d_model,
             latent_dim=jepa_cfg.get("latent_dim", d_model),
             predictor_hidden_multiplier=jepa_cfg.get("predictor_hidden_multiplier", 2.0),
-            horizons=jepa_cfg.get("horizons", [8, 32, 128]),
-            horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.3, 0.2]),
+            horizons=jepa_cfg.get("horizons", [1, 2, 8, 32, 64]),
+            horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.25, 0.15, 0.06, 0.04]),
             pairs_per_seq=jepa_cfg.get("pairs_per_seq", 64),
             ema_momentum=jepa_cfg.get("ema_momentum", 0.996),
             gamma_var=jepa_cfg.get("gamma_var", 1.0),
-            gamma_cov=jepa_cfg.get("gamma_cov", 1.0),
+            gamma_cov=jepa_cfg.get("gamma_cov", 0.2),
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
             gamma_var_pred=jepa_cfg.get("gamma_var_pred", 0.0),
             gamma_cov_pred=jepa_cfg.get("gamma_cov_pred", 0.0),
         )
 
+        latent_dim = jepa_cfg.get("latent_dim", d_model)
+        self.latent_to_model = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.latent_output_bias = nn.Parameter(torch.zeros(vocab_size))
+
+        hv = self.jepa.horizon_values
+        try:
+            matches = (hv == 1).nonzero(as_tuple=True)
+            if matches and matches[0].numel() > 0:
+                self.latent_k1_index = int(matches[0][0].item())
+            else:
+                self.latent_k1_index = -1
+        except Exception:
+            self.latent_k1_index = -1
+
         # JEPA/LM weights
-        self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
-        self.lm_weight_final = float(jepa_cfg.get("lm_weight", 1.0))
+        self.jepa_weight = float(jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1)))
+        self.latent_lm_weight = float(jepa_cfg.get("latent_lm_weight", jepa_cfg.get("latent_ce_weight", 0.0)))
+        classic_weight = jepa_cfg.get("classic_lm_weight", jepa_cfg.get("lm_weight", 1.0))
+        self.lm_weight_final = float(classic_weight)
 
         # Baseline toggle (disables JEPA)
         self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
         if self.run_baseline:
             self.jepa_weight = 0.0
+            self.latent_lm_weight = 0.0
             self.lm_weight_final = 1.0
 
         # LM weight scheduling
@@ -122,6 +144,52 @@ class LitJEPA(L.LightningModule):
         )
         return loss
 
+    def _latent_logits(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.latent_to_model(z)
+        if getattr(self.model, "weight_tying", False):
+            W = self.model.token_emb.weight
+        else:
+            W = self.model.lm_head.weight
+        logits = h @ W.T
+        logit_scale = getattr(self.model, "logit_scale", None)
+        if logit_scale is not None:
+            logits = logits * logit_scale
+        logits = logits + self.latent_output_bias
+        return logits
+
+    def _latent_lm_loss(self, jepa_out: Dict[str, torch.Tensor], x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        if self.latent_lm_weight <= 0.0:
+            return torch.tensor(0.0, device=device)
+        if "z_pred" not in jepa_out or "pairs" not in jepa_out:
+            return torch.tensor(0.0, device=device)
+        if self.latent_k1_index < 0:
+            return torch.tensor(0.0, device=device)
+
+        z_pred = jepa_out["z_pred"]
+        b_idx, _, tpos, k_ids = jepa_out["pairs"]
+        mask = (k_ids == self.latent_k1_index)
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=z_pred.device)
+
+        logits = self._latent_logits(z_pred[mask])
+        targets = x[b_idx[mask], tpos[mask]]
+        return F.cross_entropy(logits, targets)
+
+    def _build_full_k1_pairs(self, batch: torch.Tensor):
+        if self.latent_k1_index < 0:
+            return None
+        B, T = batch.shape
+        if T < 2:
+            return None
+        device = batch.device
+        steps = torch.arange(T - 1, device=device, dtype=torch.long)
+        t_idx = steps.unsqueeze(0).expand(B, -1).reshape(-1)
+        b_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(-1, T - 1).reshape(-1)
+        tpos = t_idx + 1
+        k_ids = torch.full((B * (T - 1),), self.latent_k1_index, device=device, dtype=torch.long)
+        return b_idx, t_idx, tpos, k_ids
+
     def _current_lm_weight(self, step: int) -> float:
         # If scheduler is disabled, use lm_weight as a constant from step 0
         if not self.lm_weight_use_scheduler:
@@ -146,9 +214,11 @@ class LitJEPA(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x = batch  # (B,T)
-        use_jepa = self.jepa_weight > 0.0
+        use_jepa_loss = self.jepa_weight > 0.0
+        need_latent = self.latent_lm_weight > 0.0
+        need_jepa = use_jepa_loss or need_latent
 
-        if use_jepa:
+        if need_jepa:
             h_jepa, h_final = self.model(
                 x, tap_layer=self.jepa_tap_layer, return_tap=True,
                 grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
@@ -157,22 +227,30 @@ class LitJEPA(L.LightningModule):
             h_final = self.model(x, tap_layer=None, return_tap=False)
             h_jepa = None
 
-        lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
+        lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=x.device)
 
-        if use_jepa:
-            jepa_out = self.jepa(h_jepa)
-            jepa_loss = jepa_out["loss"]
+        if need_jepa:
+            jepa_out = self.jepa(h_jepa, return_latents=need_latent)
+            jepa_loss = jepa_out["loss"] if use_jepa_loss else torch.tensor(0.0, device=x.device)
         else:
             jepa_out = {}
-            jepa_loss = torch.tensor(0.0, device=self.device)
+            jepa_loss = torch.tensor(0.0, device=x.device)
+
+        latent_ce = self._latent_lm_loss(jepa_out, x) if need_latent else torch.tensor(0.0, device=x.device)
 
         eff_lm_w = self._current_lm_weight(self.global_step)
-        total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
+        total_loss = (
+            self.jepa_weight * jepa_loss
+            + self.latent_lm_weight * latent_ce
+            + eff_lm_w * lm_loss
+        )
 
         # Minimal logging (core metrics only)
         self.log("train/lm_loss", lm_loss, on_step=True)
+        if need_latent:
+            self.log("train/latent_ce", latent_ce, on_step=True)
 
-        if use_jepa:
+        if use_jepa_loss:
             self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
             self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_step=True)
             g = torch.sigmoid(self.model.lm_bridge_gate)
@@ -205,10 +283,15 @@ class LitJEPA(L.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         x = batch
-        use_jepa = self.jepa_weight > 0.0
+        use_jepa_loss = self.jepa_weight > 0.0
+        need_latent = self.latent_lm_weight > 0.0
+        need_jepa = use_jepa_loss or need_latent
+
+        latent_ce_eval = None
+        latent_ppl_eval = None
 
         with torch.no_grad():
-            if use_jepa:
+            if need_jepa:
                 h_jepa, h_final = self.model(
                     x, tap_layer=self.jepa_tap_layer, return_tap=True,
                     grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
@@ -217,9 +300,9 @@ class LitJEPA(L.LightningModule):
                 h_final = self.model(x, tap_layer=None, return_tap=False)
                 h_jepa = None
 
-            lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
+            lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=x.device)
 
-            if use_jepa:
+            if use_jepa_loss:
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
                 jepa_out = self.jepa(h_jepa, pairs=pairs)
@@ -272,25 +355,39 @@ class LitJEPA(L.LightningModule):
                     # Compute margin: positive margin means better separation
                     margin = dist_imposter - dist_true
                 else:
-                    top1_acc = torch.tensor(0.0, device=self.device)
-                    margin = torch.tensor(0.0, device=self.device)
+                    top1_acc = torch.tensor(0.0, device=x.device)
+                    margin = torch.tensor(0.0, device=x.device)
 
                 # Global normalized top-1
                 if count_sum > 0:
-                    self.log("val/norm_top1", torch.tensor(weighted_norm_sum / count_sum, device=self.device),
+                    self.log("val/norm_top1", torch.tensor(weighted_norm_sum / count_sum, device=x.device),
                             on_epoch=True, sync_dist=True)
 
                 jepa_loss = jepa_out["loss"]
             else:
-                jepa_out, jepa_loss = {}, torch.tensor(0.0, device=self.device)
-                top1_acc = torch.tensor(0.0, device=self.device)
-                margin = torch.tensor(0.0, device=self.device)
+                jepa_out, jepa_loss = {}, torch.tensor(0.0, device=x.device)
+                top1_acc = torch.tensor(0.0, device=x.device)
+                margin = torch.tensor(0.0, device=x.device)
+
+            if need_jepa and self.latent_k1_index >= 0 and h_jepa is not None:
+                k1_pairs = self._build_full_k1_pairs(x)
+                if k1_pairs is not None:
+                    z_pred_k1, _, _ = self.jepa.compute_latents(h_jepa, pairs=k1_pairs)
+                    logits_k1 = self._latent_logits(z_pred_k1)
+                    b_idx, _, tpos, _ = k1_pairs
+                    targets_k1 = x[b_idx, tpos]
+                    latent_ce_eval = F.cross_entropy(logits_k1, targets_k1)
+                    latent_ppl_eval = torch.exp(latent_ce_eval)
 
         # Core validation metrics only
         self.log("val/top1_acc", top1_acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
         
-        if use_jepa:
+        if latent_ce_eval is not None:
+            self.log("val/latent_ce", latent_ce_eval, on_epoch=True, sync_dist=True)
+            self.log("val/latent_ppl", latent_ppl_eval, prog_bar=True, on_epoch=True, sync_dist=True)
+
+        if use_jepa_loss:
             self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
             self.log("val/std_pred", jepa_out.get("std_pred", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
             self.log("val/std_anchor", jepa_out.get("std_anchor", torch.tensor(0.0, device=self.device)), on_epoch=True, sync_dist=True)
@@ -310,7 +407,7 @@ class LitJEPA(L.LightningModule):
     def on_fit_start(self):
         # Freeze unused modules to avoid DDP unused-param errors
         try:
-            if self.lm_weight_final <= 0.0:
+            if self.lm_weight_final <= 0.0 and self.latent_lm_weight <= 0.0:
                 for p in self.model.lm_head.parameters():
                     p.requires_grad = False
 
@@ -358,6 +455,8 @@ class LitJEPA(L.LightningModule):
                     else:
                         self.model.logit_scale = None
                         self.model.output_bias = None
+
+                    self.latent_output_bias = nn.Parameter(torch.zeros(new_V, device=device))
 
                     self.hparams.vocab_size = new_V
                     
@@ -445,6 +544,10 @@ class LitJEPA(L.LightningModule):
                 # LM gradients reach embeddings, so train embeddings with fast LR
                 head_params += list(self.model.token_emb.parameters())
             head_ids = {id(p) for p in head_params}
+
+        latent_head_params = list(self.latent_to_model.parameters()) + [self.latent_output_bias]
+        head_params += latent_head_params
+        head_ids.update({id(p) for p in latent_head_params})
 
         # Backbone: everything else that requires grad and isn't in head_ids
         backbone_params = [p for p in self.parameters() if p.requires_grad and id(p) not in head_ids]

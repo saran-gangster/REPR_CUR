@@ -16,29 +16,31 @@ model:
   ff_multiplier: 4
   use_rope: true
   rope_base: 10000
-  weight_tying: false
+  weight_tying: true
 
   jepa:
-    latent_dim: 512
-    horizons: [2, 8, 32, 64]
-    horizon_probs: [0.4, 0.3, 0.2, 0.1]
-    ema_momentum: 0.996
-    gamma_var: 1.0
-    gamma_cov: 1.0
-    tau: 0.1
-    tap_layer: -4
-    tap_norm: true
-    grad_barrier: true
-    jepa_weight: 1.0
-    lm_weight: 0.75
-    lm_weight_use_scheduler: false
+  latent_dim: 512
+  horizons: [1, 2, 8, 32, 64]
+  horizon_probs: [0.5, 0.25, 0.15, 0.06, 0.04]
+  ema_momentum: 0.996
+  gamma_var: 1.0
+  gamma_cov: 0.2
+  tau: 0.1
+  tap_layer: -4
+  tap_norm: true
+  grad_barrier: true
+  jepa_weight: 1.0
+  latent_lm_weight: 0.5
+  classic_lm_weight: 0.1
+  lm_weight: 0.1
+  lm_weight_use_scheduler: false
 
   optimizer:
-    lr: 1.0e-4
-    lr_head: 1.0e-4
-    weight_decay: 0.1
-    betas: [0.9, 0.95]
-    warmup_steps: 1500
+  lr: 1.0e-4
+  lr_head: 2.5e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  warmup_steps: 1500
 
 data:
   module: wikitext2           

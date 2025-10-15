@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pytest
 import lightning as L
 from torch.utils.data import Dataset, DataLoader 
@@ -192,3 +193,115 @@ def test_bf16_mixed_precision_one_step_cuda():
             total_norm += g.norm().item()
             count += 1
     assert count > 0 and total_norm > 0.0, "No gradients were produced."
+
+
+# --------------------------------------------------------------
+# 5) Latent decoder integration sanity checks (CPU)
+# --------------------------------------------------------------
+
+
+def _make_test_model(vocab_size: int = 128, seq_len: int = 64):
+    jepa_cfg = dict(
+        latent_dim=64,
+        predictor_hidden_multiplier=1.0,
+        horizons=[1, 2],
+        horizon_probs=[0.7, 0.3],
+        pairs_per_seq=16,
+        ema_momentum=0.996,
+        gamma_var=1.0,
+        gamma_cov=0.2,
+        tau=0.1,
+        tap_layer=-1,
+        grad_barrier=True,
+        tap_norm=True,
+        jepa_weight=1.0,
+        latent_lm_weight=0.5,
+        classic_lm_weight=0.1,
+        lm_weight_use_scheduler=False,
+    )
+    optimizer_cfg = dict(lr=3.0e-4, lr_head=6.0e-4, weight_decay=0.0, betas=(0.9, 0.95), warmup_steps=10)
+    model = LitJEPA(
+        vocab_size=vocab_size,
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        dropout=0.0,
+        ff_multiplier=2,
+        use_rope=True,
+        weight_tying=True,
+        jepa=jepa_cfg,
+        optimizer=optimizer_cfg,
+    )
+
+    class _DummyTrainer:
+        def __init__(self, max_steps: int = 10):
+            self.max_steps = max_steps
+            self.datamodule = None
+            self.global_step = 0
+
+    model.trainer = _DummyTrainer()
+    model.log = lambda *args, **kwargs: None
+    model.seq_len_for_tests = seq_len  # stash for convenience
+    return model
+
+
+def test_latent_loss_backward_propagates():
+    _set_seed(9001)
+    model = _make_test_model()
+    model.train()
+    batch = torch.randint(0, model.hparams.vocab_size, (3, model.seq_len_for_tests), dtype=torch.long)
+
+    model.zero_grad(set_to_none=True)
+    loss = model.training_step(batch, batch_idx=0)
+    assert torch.isfinite(loss), "Training step returned non-finite loss."
+    loss.backward()
+
+    grad_norm = 0.0
+    for p in model.latent_to_model.parameters():
+        assert p.grad is not None, "Latent-to-model projector received no gradient."
+        assert torch.isfinite(p.grad).all(), "Latent-to-model gradient contains NaNs or infs."
+        grad_norm += p.grad.norm().item()
+    assert grad_norm > 0.0, "Latent-to-model gradients vanished."
+    assert model.latent_output_bias.grad is not None and torch.isfinite(model.latent_output_bias.grad).all()
+
+
+def test_build_full_k1_pairs_covers_all_steps():
+    _set_seed(1337)
+    model = _make_test_model(seq_len=33)
+    batch = torch.randint(0, model.hparams.vocab_size, (2, 33), dtype=torch.long)
+    pairs = model._build_full_k1_pairs(batch)
+    assert pairs is not None
+    b_idx, t_idx, tpos, k_ids = pairs
+    assert b_idx.shape[0] == batch.size(0) * (batch.size(1) - 1)
+    assert torch.all(tpos == t_idx + 1)
+    assert torch.all(k_ids == model.latent_k1_index)
+    assert t_idx.min() == 0
+    assert t_idx.max() == batch.size(1) - 2
+
+
+def test_latent_loss_masks_non_k1_pairs():
+    _set_seed(2025)
+    model = _make_test_model()
+    latent_dim = model.latent_to_model[0].normalized_shape[0]
+    z_pred = torch.randn(6, latent_dim)
+    b_idx = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    tpos = torch.tensor([1, 2, 1, 2, 1, 2], dtype=torch.long)
+    k_ids = torch.tensor([
+        model.latent_k1_index,
+        1,
+        model.latent_k1_index,
+        1,
+        model.latent_k1_index,
+        1,
+    ], dtype=torch.long)
+    x = torch.randint(0, model.hparams.vocab_size, (3, model.seq_len_for_tests), dtype=torch.long)
+
+    jepa_out = {
+        "z_pred": z_pred,
+        "pairs": (b_idx, torch.zeros_like(b_idx), tpos, k_ids),
+    }
+
+    loss = model._latent_lm_loss(jepa_out, x)
+    mask = (k_ids == model.latent_k1_index)
+    expected = F.cross_entropy(model._latent_logits(z_pred[mask]), x[b_idx[mask], tpos[mask]])
+    assert torch.allclose(loss, expected, atol=1e-6)

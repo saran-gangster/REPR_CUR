@@ -46,15 +46,15 @@ model:
     run_baseline: false
 
   optimizer:
-    #5.0e-5
-    lr: 1.0e-4 
+    # 5.0e-5
+    lr: 1.0e-4
     lr_head: 1.0e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 200
 
 data:
-  module: tiny_shakespeare     
+  module: tiny_shakespeare
   data_dir: data/
   block_size: 512
   batch_size: 32

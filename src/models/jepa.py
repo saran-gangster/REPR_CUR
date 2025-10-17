@@ -26,12 +26,12 @@ class JEPAObjective(nn.Module):
         d_model: int,
         latent_dim: int = 256,
         predictor_hidden_multiplier: float = 2.0,
-        horizons: List[int] = [1, 2, 8, 32, 64],
-        horizon_probs: List[float] = [0.5, 0.25, 0.15, 0.06, 0.04],
+    horizons: List[int] = [8, 32, 128],
+    horizon_probs: List[float] = [0.5, 0.3, 0.2],
         pairs_per_seq: int = 64,
         ema_momentum: float = 0.996,
         gamma_var: float = 1.0,
-        gamma_cov: float = 0.2,
+    gamma_cov: float = 1.0,
         dropout: float = 0.0,
         tau: float = 0.2,
         gamma_var_pred: float = 0.0,
@@ -94,19 +94,11 @@ class JEPAObjective(nn.Module):
             generator=generator,
         )
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-        return_latents: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+    def forward(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
         """
         h: (B, T, C) hidden states from tapped transformer layer
         pairs: optional (b_idx, t_idx, tpos, k_ids). If None, freshly sample pairs.
-                Returns dict with loss and diagnostics.
-                If return_latents is True, includes:
-                    - "z_pred": predicted latents (N, D)
-                    - "pairs": tuple of (b_idx, t_idx, tpos, k_ids)
+        Returns dict with loss and diagnostics.
         """
         B, T, C = h.shape
         device = h.device
@@ -183,9 +175,6 @@ class JEPAObjective(nn.Module):
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
         }
-        if return_latents:
-            out["z_pred"] = z_pred
-            out["pairs"] = (b_idx, t_idx, tpos, k_ids)
         return out
 
     @torch.no_grad()

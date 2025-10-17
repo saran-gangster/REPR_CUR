@@ -19,26 +19,25 @@ model:
   ff_multiplier: 4
   use_rope: true
   rope_base: 10000
-  weight_tying: true
+  weight_tying: false
 
   jepa:
     latent_dim: 256
     predictor_hidden_multiplier: 1.5
-    horizons: [1, 2, 8, 32, 64]
-    horizon_probs: [0.5, 0.25, 0.15, 0.06, 0.04]
+  horizons: [2, 8, 32, 64]
+  horizon_probs: [0.4, 0.3, 0.2, 0.1]
     pairs_per_seq: 64
     ema_momentum: 0.995
     gamma_var: 1.0
-    gamma_cov: 0.2
+  gamma_cov: 1.0
     tau: 0.1
     tap_layer: -3
     grad_barrier: true
     tap_norm: true
 
-    jepa_weight: 1.0
-    latent_lm_weight: 0.5
-    classic_lm_weight: 0.1
-    lm_weight_use_scheduler: false
+  jepa_weight: 1.0
+  lm_weight: 0.5
+  lm_weight_use_scheduler: false
 
     # (ignored when lm_weight_use_scheduler=false)
     lm_warmup_steps: 0
@@ -48,8 +47,8 @@ model:
 
   optimizer:
     #5.0e-5
-    lr: 1.0e-4 
-    lr_head: 2.5e-4
+  lr: 1.0e-4 
+  lr_head: 1.0e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 200

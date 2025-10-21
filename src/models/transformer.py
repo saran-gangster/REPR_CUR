@@ -98,6 +98,7 @@ class DecoderOnlyTransformer(nn.Module):
         use_rope: bool = True,
         rope_base: float = 10000.0,
         weight_tying: bool = False,
+        simple_recurrence_steps: int = 0,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -110,6 +111,7 @@ class DecoderOnlyTransformer(nn.Module):
         self.n_layers = n_layers
 
         self.weight_tying = bool(weight_tying)
+        self.simple_recurrence_steps = max(0, int(simple_recurrence_steps))
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if self.weight_tying:
@@ -131,8 +133,30 @@ class DecoderOnlyTransformer(nn.Module):
         )
         self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
 
+    def tap_index(self, tap_layer: Optional[int]) -> Optional[int]:
+        if tap_layer is None:
+            return None
+        tl = tap_layer if tap_layer >= 0 else self.n_layers + tap_layer
+        return max(0, min(self.n_layers - 1, tl))
+
+    def simple_recurrence(self, h: torch.Tensor, tap_layer: int, steps: Optional[int] = None) -> torch.Tensor:
+        if steps is None:
+            steps = self.simple_recurrence_steps
+        steps = 0 if steps is None else max(0, int(steps))
+        if steps <= 0:
+            return h
+        tl = self.tap_index(tap_layer)
+        if tl is None:
+            return h
+        blk = self.blocks[tl]
+        x = h
+        for _ in range(steps):
+            x = blk(x)
+        return x
+
     def forward(self, idx, tap_layer: Optional[int] = None, return_tap: bool = False,
-                grad_barrier: bool = False, tap_norm: bool = False):
+                grad_barrier: bool = False, tap_norm: bool = False,
+                simple_recurrence_steps: Optional[int] = None):
         """
         idx: (B, T) token ids
         tap_layer: if not None, index of block output to return for JEPA (supports negative index)
@@ -145,34 +169,36 @@ class DecoderOnlyTransformer(nn.Module):
         x = self.token_emb(idx)
         x = self.drop(x)
 
-        tap_idx = None
-        h_tap = None
-        if tap_layer is not None:
-            tl = tap_layer if tap_layer >= 0 else self.n_layers + tap_layer
-            tl = max(0, min(self.n_layers - 1, tl))
-            tap_idx = tl
+        tap_idx = self.tap_index(tap_layer)
+        steps = self.simple_recurrence_steps if simple_recurrence_steps is None else max(0, int(simple_recurrence_steps))
+        h_tap_original = None
+        h_tap_recurrent = None
 
         g = torch.sigmoid(self.lm_bridge_gate)
 
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if tap_idx is not None and i == tap_idx:
-                h_tap = x
-                if tap_norm:
-                    h_tap = self.norm_tap(h_tap)
+                h_tap_original = x
+                h_tap_recurrent = self.simple_recurrence(h_tap_original, tap_idx, steps)
+
+                x_for_upper = h_tap_original
                 if grad_barrier:
-                    x = x.detach()
+                    x_for_upper = x_for_upper.detach()
 
                 # Existing LM-only bridge
-                x = x + g * self.lm_bridge(x)
+                x = x_for_upper + g * self.lm_bridge(x_for_upper)
 
         h_final = self.norm_f(x)
 
         if return_tap:
-            if h_tap is None:
-                h_tap = x
-                if tap_norm:
-                    h_tap = self.norm_tap(h_tap)
-            return h_tap, h_final
+            if h_tap_original is None:
+                h_tap_original = x
+            if h_tap_recurrent is None:
+                h_tap_recurrent = h_tap_original
+            if tap_norm:
+                h_tap_original = self.norm_tap(h_tap_original)
+                h_tap_recurrent = self.norm_tap(h_tap_recurrent)
+            return (h_tap_recurrent, h_tap_original), h_final
         else:
             return h_final

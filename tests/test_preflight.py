@@ -130,8 +130,18 @@ def test_transformer_rope_forward_and_causality(T: int):
     cut = T // 2
     if cut < T:
         x2[:, cut:] = torch.randint(0, 1024, (2, T - cut), dtype=torch.long)
-    h_tap_1, h_final_1 = model(x1, tap_layer=-2, return_tap=True)
-    h_tap_2, h_final_2 = model(x2, tap_layer=-2, return_tap=True)
+    tap_out_1, h_final_1 = model(x1, tap_layer=-2, return_tap=True)
+    tap_out_2, h_final_2 = model(x2, tap_layer=-2, return_tap=True)
+
+    if isinstance(tap_out_1, tuple):
+        h_tap_1 = tap_out_1[0]
+    else:
+        h_tap_1 = tap_out_1
+
+    if isinstance(tap_out_2, tuple):
+        h_tap_2 = tap_out_2[0]
+    else:
+        h_tap_2 = tap_out_2
     assert h_tap_1.shape == (2, T, 64)
     assert h_final_1.shape == (2, T, 64)
     assert torch.allclose(h_final_1[:, :cut, :], h_final_2[:, :cut, :], rtol=1e-5, atol=1e-6)

@@ -94,9 +94,16 @@ class JEPAObjective(nn.Module):
             generator=generator,
         )
 
-    def forward(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        h: torch.Tensor,
+        pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        return_latents: bool = False,
+        teacher_h: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
         """
-        h: (B, T, C) hidden states from tapped transformer layer
+        h: (B, T, C) student hidden states from tapped transformer layer (anchor source)
+        teacher_h: optional (B, T, C) teacher hidden states (target source). Defaults to `h` if None.
         pairs: optional (b_idx, t_idx, tpos, k_ids). If None, freshly sample pairs.
         Returns dict with loss and diagnostics.
         """
@@ -116,7 +123,11 @@ class JEPAObjective(nn.Module):
 
         # gather hidden states
         h_anchor = h[b_idx, t_idx, :]           # (N, C)
-        h_target = h[b_idx, tpos, :]            # (N, C)
+        if teacher_h is None:
+            h_target = h[b_idx, tpos, :]
+        else:
+            teacher_h = teacher_h if teacher_h.device == device else teacher_h.to(device)
+            h_target = teacher_h[b_idx, tpos, :]
 
         # project to latent space
         z_anchor = self.online_proj(h_anchor)   # (N, D_latent)
@@ -175,10 +186,18 @@ class JEPAObjective(nn.Module):
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
         }
+        if return_latents:
+            out["z_pred"] = z_pred
+            out["pairs"] = (b_idx, t_idx, tpos, k_ids)
         return out
 
     @torch.no_grad()
-    def compute_latents(self, h: torch.Tensor, pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None):
+    def compute_latents(
+        self,
+        h: torch.Tensor,
+        pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        teacher_h: torch.Tensor | None = None,
+    ):
         """
         Utility for validation: return prediction/target latents using either:
         - provided fixed pairs (b_idx, t_idx, tpos, k_ids), or
@@ -203,7 +222,11 @@ class JEPAObjective(nn.Module):
                 k_ids = k_ids.to(device)
 
         h_anchor = h[b_idx, t_idx, :]    # (N, C)
-        h_target = h[b_idx, tpos, :]     # (N, C)
+        if teacher_h is None:
+            h_target = h[b_idx, tpos, :]
+        else:
+            teacher_h = teacher_h if teacher_h.device == device else teacher_h.to(device)
+            h_target = teacher_h[b_idx, tpos, :]
 
         z_anchor = self.online_proj(h_anchor)       # (N, D)
         z_k = self.horizon_emb_latent(k_ids)        # (N, D)

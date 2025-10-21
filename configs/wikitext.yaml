@@ -29,6 +29,8 @@ model:
     tap_layer: -4
     tap_norm: true
     grad_barrier: true
+    simple_recurrence_steps: 0
+    recur_at: -4
     jepa_weight: 1.0
     lm_weight: 0.75
     lm_weight_use_scheduler: false

@@ -42,25 +42,30 @@ class LitJEPA(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=['optimizer'])
 
+        jepa_cfg = jepa or {}
+
         # Transformer
+        self.simple_recurrence_steps = int(jepa_cfg.get("simple_recurrence_steps", 0))
+        self.recur_steps = self.simple_recurrence_steps
         self.model = DecoderOnlyTransformer(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
             dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base,
             weight_tying=weight_tying,
+            simple_recurrence_steps=0,
         )
+        self.model.simple_recurrence_steps = self.simple_recurrence_steps
 
         # JEPA
-        jepa_cfg = jepa or {}
         self.jepa = JEPAObjective(
             d_model=d_model,
             latent_dim=jepa_cfg.get("latent_dim", d_model),
             predictor_hidden_multiplier=jepa_cfg.get("predictor_hidden_multiplier", 2.0),
-            horizons=jepa_cfg.get("horizons", [8, 32, 128]),
-            horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.3, 0.2]),
+            horizons=jepa_cfg.get("horizons", [1, 2, 8, 32, 64]),
+            horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.25, 0.15, 0.06, 0.04]),
             pairs_per_seq=jepa_cfg.get("pairs_per_seq", 64),
             ema_momentum=jepa_cfg.get("ema_momentum", 0.996),
             gamma_var=jepa_cfg.get("gamma_var", 1.0),
-            gamma_cov=jepa_cfg.get("gamma_cov", 1.0),
+            gamma_cov=jepa_cfg.get("gamma_cov", 0.2),
             dropout=dropout,
             tau=jepa_cfg.get("tau", 0.2),
             gamma_var_pred=jepa_cfg.get("gamma_var_pred", 0.0),
@@ -85,6 +90,7 @@ class LitJEPA(L.LightningModule):
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
         self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
         self.jepa_tap_norm = bool(jepa_cfg.get("tap_norm", False))
+        self.recur_at = int(jepa_cfg.get("recur_at", self.jepa_tap_layer))
 
         # EMA schedule
         ema_sched = jepa_cfg.get("ema_schedule", None)
@@ -149,18 +155,23 @@ class LitJEPA(L.LightningModule):
         use_jepa = self.jepa_weight > 0.0
 
         if use_jepa:
-            h_jepa, h_final = self.model(
-                x, tap_layer=self.jepa_tap_layer, return_tap=True,
-                grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
+            (h_pred, h_teacher), h_final = self.model(
+                x,
+                tap_layer=self.jepa_tap_layer,
+                return_tap=True,
+                grad_barrier=self.jepa_grad_barrier,
+                tap_norm=self.jepa_tap_norm,
+                simple_recurrence_steps=self.recur_steps,
             )
         else:
             h_final = self.model(x, tap_layer=None, return_tap=False)
-            h_jepa = None
+            h_pred = None
+            h_teacher = None
 
         lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
 
         if use_jepa:
-            jepa_out = self.jepa(h_jepa)
+            jepa_out = self.jepa(h_pred, teacher_h=h_teacher)
             jepa_loss = jepa_out["loss"]
         else:
             jepa_out = {}
@@ -169,7 +180,6 @@ class LitJEPA(L.LightningModule):
         eff_lm_w = self._current_lm_weight(self.global_step)
         total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
 
-        # Minimal logging (core metrics only)
         self.log("train/lm_loss", lm_loss, on_step=True)
 
         if use_jepa:
@@ -177,6 +187,7 @@ class LitJEPA(L.LightningModule):
             self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", torch.tensor(0.0, device=self.device)), on_step=True)
             g = torch.sigmoid(self.model.lm_bridge_gate)
             self.log("train/bridge_gate", g, on_step=True)
+            self.log("train/recur_steps", torch.tensor(float(self.recur_steps), device=self.device), on_step=True)
         else:
             zero = torch.tensor(0.0, device=self.device)
             self.log("train/jepa_loss", zero, on_step=True)
@@ -188,7 +199,6 @@ class LitJEPA(L.LightningModule):
         pass
     
     def _get_or_make_val_pairs(self, B: int, T: int, device: torch.device):
-        # reuse pairs for the whole epoch to stabilize metrics
         pairs = getattr(self, "_val_pairs", None)
         if pairs is not None:
             b_idx, t_idx, tpos, _ = pairs
@@ -198,7 +208,6 @@ class LitJEPA(L.LightningModule):
                 return pairs
 
         g = torch.Generator(device=device)
-        # fixed seed per epoch for determinism; change base if you want a different stream
         g.manual_seed(12345)
         self._val_pairs = self.jepa._sample_pairs(B, T, device, generator=g)
         return self._val_pairs
@@ -209,23 +218,29 @@ class LitJEPA(L.LightningModule):
 
         with torch.no_grad():
             if use_jepa:
-                h_jepa, h_final = self.model(
-                    x, tap_layer=self.jepa_tap_layer, return_tap=True,
-                    grad_barrier=self.jepa_grad_barrier, tap_norm=self.jepa_tap_norm
+                (h_pred, h_teacher), h_final = self.model(
+                    x,
+                    tap_layer=self.jepa_tap_layer,
+                    return_tap=True,
+                    grad_barrier=self.jepa_grad_barrier,
+                    tap_norm=self.jepa_tap_norm,
+                    simple_recurrence_steps=self.recur_steps,
                 )
             else:
                 h_final = self.model(x, tap_layer=None, return_tap=False)
-                h_jepa = None
+                h_pred = None
+                h_teacher = None
 
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else torch.tensor(0.0, device=self.device)
 
             if use_jepa:
                 B, T = x.shape[0], x.shape[1]
                 pairs = self._get_or_make_val_pairs(B, T, x.device)
-                jepa_out = self.jepa(h_jepa, pairs=pairs)
+                jepa_out = self.jepa(h_pred, pairs=pairs, teacher_h=h_teacher)
+                jepa_loss = jepa_out["loss"]
 
                 # Compute latents and per-horizon metrics
-                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_jepa, pairs=pairs)
+                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_pred, pairs=pairs, teacher_h=h_teacher)
                 p = torch.nn.functional.normalize(z_pred, dim=-1)
                 y = torch.nn.functional.normalize(z_tgt, dim=-1)
                 unique_hids = torch.unique(k_ids)
@@ -417,38 +432,40 @@ class LitJEPA(L.LightningModule):
         wd = self.optim_cfg.get("weight_decay", 0.1)
         betas = self.optim_cfg.get("betas", (0.9, 0.95))
         lr_backbone = self.optim_cfg.get("lr", 3e-4)
-        lr_head = self.optim_cfg.get("lr_head", lr_backbone / 10.0)
+        lr_head = self.optim_cfg.get("lr_head", lr_backbone)
         warmup = self.optim_cfg.get("warmup_steps", 200)
 
-        # Determine if LM gradients reach the embeddings
-        speaker_owns_embeddings = not (self.jepa_weight > 0.0 and self.jepa_grad_barrier)
+        head_params: list[torch.nn.Parameter] = []
+        head_ids: set[int] = set()
 
-        # Collect head parameters
-        if getattr(self.model, "weight_tying", False):
-            head_params = []
-            ls = getattr(self.model, "logit_scale", None)
-            if ls is not None:
-                head_params.append(ls)
-            ob = getattr(self.model, "output_bias", None)
-            if ob is not None:
-                head_params.append(ob)
+        def add_head_params(params):
+            for p in params:
+                if p is None or not p.requires_grad:
+                    continue
+                head_params.append(p)
+                head_ids.add(id(p))
+
+        # JEPA heads
+        add_head_params(self.jepa.online_proj.parameters())
+        add_head_params(self.jepa.predictor.parameters())
+        add_head_params(self.jepa.horizon_emb_latent.parameters())
+
+        if self.model.weight_tying:
+            add_head_params(self.model.token_emb.parameters())
+            add_head_params([getattr(self.model, "logit_scale", None)])
+            add_head_params([getattr(self.model, "output_bias", None)])
         else:
-            head_params = list(self.model.lm_head.parameters())
-            if speaker_owns_embeddings:
-                # LM gradients reach embeddings, so train embeddings with fast LR
-                head_params += list(self.model.token_emb.parameters())
+            add_head_params(self.model.lm_head.parameters())
 
-        head_ids = {id(p) for p in head_params}
-
-        # Backbone: everything else that requires grad and isn't in head_ids
-        backbone_params = [p for p in self.parameters() if p.requires_grad and id(p) not in head_ids]
+        backbone_params = [
+            p for p in self.parameters()
+            if p is not None and p.requires_grad and id(p) not in head_ids
+        ]
 
         def split_decay(params):
             decay, no_decay = [], []
             for p in params:
-                if p is None or not p.requires_grad:
-                    continue
-                if p.ndim < 2:  # norms, biases, gates
+                if p.ndim < 2:
                     no_decay.append(p)
                 else:
                     decay.append(p)
@@ -457,27 +474,39 @@ class LitJEPA(L.LightningModule):
         head_decay, head_no_decay = split_decay(head_params)
         bb_decay, bb_no_decay = split_decay(backbone_params)
 
-        # No weight decay on "heads"; decay on backbone
-        param_groups = [
-            {"params": head_decay + head_no_decay, "lr": lr_head, "weight_decay": 0.0},
-            {"params": bb_decay, "lr": lr_backbone, "weight_decay": wd},
-            {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
-        ]
+        param_groups = []
+        if head_decay or head_no_decay:
+            param_groups.append({
+                "params": head_decay + head_no_decay,
+                "lr": lr_head,
+                "weight_decay": 0.0,
+            })
+        if bb_decay:
+            param_groups.append({
+                "params": bb_decay,
+                "lr": lr_backbone,
+                "weight_decay": wd,
+            })
+        if bb_no_decay:
+            param_groups.append({
+                "params": bb_no_decay,
+                "lr": lr_backbone,
+                "weight_decay": 0.0,
+            })
 
-        optimizer = torch.optim.AdamW(param_groups, betas=betas)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr_backbone, betas=betas)
 
         if self.trainer.max_steps is None:
             return optimizer
-        else:
-            scheduler = WarmupCosineLR(optimizer, warmup_steps=warmup, max_steps=self.trainer.max_steps)
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "frequency": 1
-                },
-            }
+
+        scheduler = WarmupCosineLR(optimizer, warmup_steps=warmup, max_steps=self.trainer.max_steps)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
             
     # Per-branch gradient clipping; compatible with Lightning variants (with or without optimizer_idx arg)
     def configure_gradient_clipping(

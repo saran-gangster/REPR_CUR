@@ -37,32 +37,22 @@ class UnifiedDataModule(L.LightningDataModule):
         
         # Collect all provided arguments (both explicit and kwargs)
         self._dm_kwargs: Dict[str, Any] = dict(kwargs)
-        
-        # Add explicitly declared params if they were provided
-        if data_dir is not None:
-            self._dm_kwargs['data_dir'] = data_dir
-        if block_size is not None:
-            self._dm_kwargs['block_size'] = block_size
-        if batch_size is not None:
-            self._dm_kwargs['batch_size'] = batch_size
-        if num_workers is not None:
-            self._dm_kwargs['num_workers'] = num_workers
-        if download_url is not None:
-            self._dm_kwargs['download_url'] = download_url
-        if bpe_vocab_size is not None:
-            self._dm_kwargs['bpe_vocab_size'] = bpe_vocab_size
-        if bpe_min_frequency is not None:
-            self._dm_kwargs['bpe_min_frequency'] = bpe_min_frequency
-        if bpe_lowercase is not None:
-            self._dm_kwargs['bpe_lowercase'] = bpe_lowercase
-        if bpe_special_tokens is not None:
-            self._dm_kwargs['bpe_special_tokens'] = bpe_special_tokens
-        if hf_cache_dir is not None:
-            self._dm_kwargs['hf_cache_dir'] = hf_cache_dir
-        if train_fraction is not None:
-            self._dm_kwargs['train_fraction'] = train_fraction
-        if subset_seed is not None:
-            self._dm_kwargs['subset_seed'] = subset_seed
+
+        optional_args = {
+            "data_dir": data_dir,
+            "block_size": block_size,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "download_url": download_url,
+            "bpe_vocab_size": bpe_vocab_size,
+            "bpe_min_frequency": bpe_min_frequency,
+            "bpe_lowercase": bpe_lowercase,
+            "bpe_special_tokens": bpe_special_tokens,
+            "hf_cache_dir": hf_cache_dir,
+            "train_fraction": train_fraction,
+            "subset_seed": subset_seed,
+        }
+        self._dm_kwargs.update({k: v for k, v in optional_args.items() if v is not None})
             
         self._dm: Optional[L.LightningDataModule] = None
 

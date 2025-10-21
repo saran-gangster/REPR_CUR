@@ -94,6 +94,25 @@ class JEPAObjective(nn.Module):
             generator=generator,
         )
 
+    def _resolve_pairs(
+        self,
+        pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        B: int,
+        T: int,
+        device: torch.device,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if pairs is None:
+            b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device, generator=generator)
+        else:
+            b_idx, t_idx, tpos, k_ids = pairs
+            if b_idx.device != device:
+                b_idx = b_idx.to(device, non_blocking=True)
+                t_idx = t_idx.to(device, non_blocking=True)
+                tpos = tpos.to(device, non_blocking=True)
+                k_ids = k_ids.to(device, non_blocking=True)
+        return b_idx, t_idx, tpos, k_ids
+
     def forward(
         self,
         h: torch.Tensor,
@@ -111,22 +130,15 @@ class JEPAObjective(nn.Module):
         device = h.device
 
         # Use fixed pairs if provided; else sample
-        if pairs is None:
-            b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
-        else:
-            b_idx, t_idx, tpos, k_ids = pairs
-            if b_idx.device != device:
-                b_idx = b_idx.to(device)
-                t_idx = t_idx.to(device)
-                tpos = tpos.to(device)
-                k_ids = k_ids.to(device)
+        b_idx, t_idx, tpos, k_ids = self._resolve_pairs(pairs, B, T, device)
 
         # gather hidden states
         h_anchor = h[b_idx, t_idx, :]           # (N, C)
         if teacher_h is None:
             h_target = h[b_idx, tpos, :]
         else:
-            teacher_h = teacher_h if teacher_h.device == device else teacher_h.to(device)
+            if teacher_h.device != device:
+                teacher_h = teacher_h.to(device, non_blocking=True)
             h_target = teacher_h[b_idx, tpos, :]
 
         # project to latent space
@@ -147,7 +159,7 @@ class JEPAObjective(nn.Module):
         tau = self.tau
         unique_hids = torch.unique(k_ids)
         total_n = p.size(0)
-        info_loss = torch.zeros((), device=device)
+        info_loss = p.new_zeros(())
 
         for hid in unique_hids:
             idx = (k_ids == hid).nonzero(as_tuple=True)[0]
@@ -167,8 +179,8 @@ class JEPAObjective(nn.Module):
         cov_loss = covariance_loss(z_anchor)
 
         # Optional stability regularization on z_pred
-        var_pred = variance_loss(z_pred) if self.gamma_var_pred > 0.0 else torch.tensor(0.0, device=device)
-        cov_pred = covariance_loss(z_pred) if self.gamma_cov_pred > 0.0 else torch.tensor(0.0, device=device)
+        var_pred = variance_loss(z_pred) if self.gamma_var_pred > 0.0 else z_pred.new_zeros(())
+        cov_pred = covariance_loss(z_pred) if self.gamma_cov_pred > 0.0 else z_pred.new_zeros(())
 
         loss = info_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
         if self.gamma_var_pred > 0.0:
@@ -210,22 +222,14 @@ class JEPAObjective(nn.Module):
         B, T, C = h.shape
         device = h.device
 
-        if pairs is None:
-            b_idx, t_idx, tpos, k_ids = self._sample_pairs(B, T, device)
-        else:
-            b_idx, t_idx, tpos, k_ids = pairs
-            # move to correct device if needed
-            if b_idx.device != device:
-                b_idx = b_idx.to(device)
-                t_idx = t_idx.to(device)
-                tpos = tpos.to(device)
-                k_ids = k_ids.to(device)
+        b_idx, t_idx, tpos, k_ids = self._resolve_pairs(pairs, B, T, device)
 
         h_anchor = h[b_idx, t_idx, :]    # (N, C)
         if teacher_h is None:
             h_target = h[b_idx, tpos, :]
         else:
-            teacher_h = teacher_h if teacher_h.device == device else teacher_h.to(device)
+            if teacher_h.device != device:
+                teacher_h = teacher_h.to(device, non_blocking=True)
             h_target = teacher_h[b_idx, tpos, :]
 
         z_anchor = self.online_proj(h_anchor)       # (N, D)

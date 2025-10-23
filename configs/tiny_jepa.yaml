@@ -30,7 +30,8 @@ model:
     ema_momentum: 0.995
     gamma_var: 1.0
     gamma_cov: 1.0
-    tau: 0.1
+    gamma_var_pred: 1.0
+    gamma_cov_pred: 1.0
     tap_layer: -3
     grad_barrier: true
     tap_norm: true

@@ -67,7 +67,6 @@ class LitJEPA(L.LightningModule):
             gamma_var=jepa_cfg.get("gamma_var", 1.0),
             gamma_cov=jepa_cfg.get("gamma_cov", 0.2),
             dropout=dropout,
-            tau=jepa_cfg.get("tau", 0.2),
             gamma_var_pred=jepa_cfg.get("gamma_var_pred", 0.0),
             gamma_cov_pred=jepa_cfg.get("gamma_cov_pred", 0.0),
         )
@@ -192,16 +191,32 @@ class LitJEPA(L.LightningModule):
 
         self.log("train/lm_loss", lm_loss, on_step=True)
 
+        metric_names = [
+            "invariance_loss",
+            "variance_anchor",
+            "variance_pred",
+            "covariance_anchor",
+            "covariance_pred",
+            "std_anchor",
+            "std_pred",
+        ]
+
         if use_jepa:
             self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
-            self.log("train/info_nce_loss", jepa_out.get("info_nce_loss", self._zero()), on_step=True)
+            for name in metric_names:
+                self.log(f"train/{name}", jepa_out.get(name, self._zero()), on_step=True)
+            std_anchor = jepa_out.get("std_anchor", self._zero())
+            std_pred = jepa_out.get("std_pred", self._zero())
+            self.log("train/std_gap", std_pred - std_anchor, on_step=True)
             g = torch.sigmoid(self.model.lm_bridge_gate)
             self.log("train/bridge_gate", g, on_step=True)
             self.log("train/recur_steps", self._scalar(self.recur_steps), on_step=True)
         else:
             zero = self._zero()
             self.log("train/jepa_loss", zero, on_step=True)
-            self.log("train/info_nce_loss", zero, on_step=True)
+            for name in metric_names:
+                self.log(f"train/{name}", zero, on_step=True)
+            self.log("train/std_gap", zero, on_step=True)
 
         return total_loss
     
@@ -227,104 +242,74 @@ class LitJEPA(L.LightningModule):
         pairs = self._get_or_make_val_pairs(B, T, x.device)
         jepa_out = self.jepa(h_pred, pairs=pairs, teacher_h=h_teacher)
 
-        z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_pred, pairs=pairs, teacher_h=h_teacher)
-        if z_pred.numel() == 0:
-            zero = self._zero()
-            return jepa_out, jepa_out["loss"], zero, zero
+        zero = self._zero()
+        invariance = jepa_out.get("invariance_loss", zero)
+        var_anchor = jepa_out.get("variance_anchor", zero)
+        var_pred = jepa_out.get("variance_pred", zero)
+        cov_anchor = jepa_out.get("covariance_anchor", zero)
+        cov_pred = jepa_out.get("covariance_pred", zero)
+        std_anchor = jepa_out.get("std_anchor", zero)
+        std_pred = jepa_out.get("std_pred", zero)
 
-        p = torch.nn.functional.normalize(z_pred, dim=-1)
-        y = torch.nn.functional.normalize(z_tgt, dim=-1)
-        unique_hids = torch.unique(k_ids)
+        metrics = {
+            "invariance_loss": invariance,
+            "variance_anchor": var_anchor,
+            "variance_pred": var_pred,
+            "covariance_anchor": cov_anchor,
+            "covariance_pred": cov_pred,
+            "std_anchor": std_anchor,
+            "std_pred": std_pred,
+            "std_gap": std_pred - std_anchor,
+            "pair_count": self._scalar(float(pairs[0].numel())),
+        }
 
-        total_n = 0
-        correct_sum = 0.0
-        dtrue_sum = 0.0
-        dneg_sum = 0.0
-        weighted_norm_sum = 0.0
-        count_sum = 0
-
-        for hid in unique_hids:
-            horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
-            n_h = int(horizon_idx.numel())
-            if n_h < 2:
-                continue
-
-            p_h, y_h = p[horizon_idx], y[horizon_idx]
-            sim = p_h @ y_h.T
-            pos_sim = sim.diag()
-
-            sim_neg = sim.clone()
-            sim_neg.fill_diagonal_(-float("inf"))
-            max_neg_sim, _ = sim_neg.max(dim=1)
-
-            acc_h = (pos_sim > max_neg_sim).float().mean()
-
-            hval = int(self.jepa.horizons[int(hid)]) if hasattr(self.jepa, "horizons") else int(hid.item())
-            self.log(f"val/top1_acc_h{hval}", acc_h, on_epoch=True, sync_dist=True)
-
-            chance_h = 1.0 / float(n_h)
-            norm_top1_h = (acc_h - chance_h) / max(1.0 - chance_h, 1e-8)
-            self.log(f"val/norm_top1_h{hval}", norm_top1_h, on_epoch=True, sync_dist=True)
-
-            norm_top1_h_val = float(norm_top1_h.item())
-            weighted_norm_sum += norm_top1_h_val * n_h
-            count_sum += n_h
-
-            correct_sum += (pos_sim > max_neg_sim).float().sum().item()
-            dtrue_sum += (1.0 - pos_sim).sum().item()
-            dneg_sum += (1.0 - max_neg_sim).sum().item()
-            total_n += n_h
-
-        if count_sum > 0:
-            self.log(
-                "val/norm_top1",
-                self._scalar(weighted_norm_sum / count_sum),
-                on_epoch=True,
-                sync_dist=True,
-            )
-
-        if total_n > 0:
-            top1_acc = self._scalar(correct_sum / total_n)
-            dist_true = dtrue_sum / total_n
-            dist_imposter = dneg_sum / total_n
-            margin = self._scalar(dist_imposter - dist_true)
-        else:
-            zero = self._zero()
-            top1_acc = zero
-            margin = zero
-
-        return jepa_out, jepa_out["loss"], top1_acc, margin
+        return jepa_out, jepa_out.get("loss", zero), metrics
     
     def validation_step(self, batch, batch_idx):
         x = batch
         use_jepa = self._is_jepa_active()
+
+        zero = self._zero()
 
         with torch.no_grad():
             (h_pred, h_teacher), h_final = self._forward_transformer(x, use_jepa=use_jepa)
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else self._zero()
 
             if use_jepa:
-                jepa_out, jepa_loss, top1_acc, margin = self._validation_jepa_eval(h_pred, h_teacher, x)
+                jepa_out, jepa_loss, metrics = self._validation_jepa_eval(h_pred, h_teacher, x)
             else:
-                zero = self._zero()
-                jepa_out, jepa_loss, top1_acc, margin = {}, zero, zero, zero
+                jepa_out, jepa_loss, metrics = {}, zero, {
+                    "invariance_loss": zero,
+                    "variance_anchor": zero,
+                    "variance_pred": zero,
+                    "covariance_anchor": zero,
+                    "covariance_pred": zero,
+                    "std_anchor": zero,
+                    "std_pred": zero,
+                    "std_gap": zero,
+                    "pair_count": zero,
+                }
 
-        self.log("val/top1_acc", top1_acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
-        if use_jepa:
-            self.log("val/info_nce_loss", jepa_out.get("info_nce_loss", self._zero()), on_epoch=True, sync_dist=True)
-            self.log("val/std_pred", jepa_out.get("std_pred", self._zero()), on_epoch=True, sync_dist=True)
-            self.log("val/std_anchor", jepa_out.get("std_anchor", self._zero()), on_epoch=True, sync_dist=True)
-            self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)
-            self.log("val/margin", margin, on_epoch=True, sync_dist=True)
-        else:
-            zero = self._zero()
-            self.log("val/info_nce_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/std_pred", zero, on_epoch=True, sync_dist=True)
-            self.log("val/std_anchor", zero, on_epoch=True, sync_dist=True)
-            self.log("val/jepa_loss", zero, on_epoch=True, sync_dist=True)
-            self.log("val/margin", zero, on_epoch=True, sync_dist=True)
+        metric_names = [
+            "invariance_loss",
+            "variance_anchor",
+            "variance_pred",
+            "covariance_anchor",
+            "covariance_pred",
+            "std_anchor",
+            "std_pred",
+            "std_gap",
+            "pair_count",
+        ]
+
+        for name in metric_names:
+            value = metrics.get(name, zero)
+            prog_bar = name == "invariance_loss"
+            self.log(f"val/{name}", value, on_epoch=True, sync_dist=True, prog_bar=prog_bar)
+
+        self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)
         
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Only update EMA if JEPA is active

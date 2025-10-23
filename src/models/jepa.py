@@ -33,7 +33,6 @@ class JEPAObjective(nn.Module):
         gamma_var: float = 1.0,
         gamma_cov: float = 1.0,
         dropout: float = 0.0,
-        tau: float = 0.2,
         gamma_var_pred: float = 0.0,
         gamma_cov_pred: float = 0.0,
     ):
@@ -45,7 +44,6 @@ class JEPAObjective(nn.Module):
         self.gamma_cov = gamma_cov
         self.gamma_var_pred = gamma_var_pred
         self.gamma_cov_pred = gamma_cov_pred
-        self.tau = tau
 
         # Register sampling buffers
         probs = torch.tensor(horizon_probs, dtype=torch.float)
@@ -151,42 +149,31 @@ class JEPAObjective(nn.Module):
         # predictor in latent space
         z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D_latent)
 
-        # normalize for similarity
-        p = F.normalize(z_pred, dim=-1)
-        y = F.normalize(z_tgt, dim=-1)
+        # VICReg components
+        if z_pred.numel() == 0:
+            zero = z_pred.new_zeros(())
+            invariance = zero
+            var_anchor = zero
+            cov_anchor = zero
+            var_pred = zero
+            cov_pred = zero
+            loss = zero
+        else:
+            invariance = F.mse_loss(z_pred, z_tgt)
 
-        # InfoNCE per-horizon (in-batch negatives within each horizon bucket)
-        tau = self.tau
-        unique_hids = torch.unique(k_ids)
-        total_n = p.size(0)
-        info_loss = p.new_zeros(())
+            var_anchor = variance_loss(z_anchor)
+            cov_anchor = covariance_loss(z_anchor)
 
-        for hid in unique_hids:
-            idx = (k_ids == hid).nonzero(as_tuple=True)[0]
-            n = idx.numel()
-            if n == 0:
-                continue
+            var_pred = variance_loss(z_pred)
+            cov_pred = covariance_loss(z_pred)
 
-            sim = (p[idx] @ y[idx].T) / tau  # (n, n)
-
-            # InfoNCE with diagonal as positives
-            target = torch.arange(n, device=device)
-            loss_h = F.cross_entropy(sim, target)
-            info_loss = info_loss + loss_h * (n / max(1, total_n))
-
-        # VICReg-style regularization on the ONLINE PROJECTOR's output to prevent collapse
-        var_loss = variance_loss(z_anchor)
-        cov_loss = covariance_loss(z_anchor)
-
-        # Optional stability regularization on z_pred
-        var_pred = variance_loss(z_pred) if self.gamma_var_pred > 0.0 else z_pred.new_zeros(())
-        cov_pred = covariance_loss(z_pred) if self.gamma_cov_pred > 0.0 else z_pred.new_zeros(())
-
-        loss = info_loss + self.gamma_var * var_loss + self.gamma_cov * cov_loss
-        if self.gamma_var_pred > 0.0:
-            loss = loss + self.gamma_var_pred * var_pred
-        if self.gamma_cov_pred > 0.0:
-            loss = loss + self.gamma_cov_pred * cov_pred
+            loss = invariance
+            loss = loss + self.gamma_var * var_anchor
+            loss = loss + self.gamma_cov * cov_anchor
+            if self.gamma_var_pred > 0.0:
+                loss = loss + self.gamma_var_pred * var_pred
+            if self.gamma_cov_pred > 0.0:
+                loss = loss + self.gamma_cov_pred * cov_pred
 
         # Keep only essential diagnostics
         std_anchor = z_anchor.std(dim=0, unbiased=False).mean()
@@ -194,7 +181,11 @@ class JEPAObjective(nn.Module):
 
         out = {
             "loss": loss,
-            "info_nce_loss": info_loss.detach(),
+            "invariance_loss": invariance.detach(),
+            "variance_anchor": var_anchor.detach(),
+            "variance_pred": var_pred.detach(),
+            "covariance_anchor": cov_anchor.detach(),
+            "covariance_pred": cov_pred.detach(),
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
         }

@@ -28,23 +28,22 @@ model:
     horizon_probs: [0.4, 0.3, 0.2, 0.1]
     pairs_per_seq: 64
     ema_momentum: 0.995
-    gamma_var: 1.0
-    gamma_cov: 1.0
-    gamma_var_pred: 1.0
-    gamma_cov_pred: 1.0
+    loss_type: barlow
+    off_diag_scale: 0.02
+    align_scale: 1.0
     tap_layer: -3
     grad_barrier: true
     tap_norm: true
     simple_recurrence_steps: 0
     recur_at: -3
 
-    jepa_weight: 1.0
+    jepa_weight: 0.1
     lm_weight: 0.5
     lm_weight_use_scheduler: false
 
     # (ignored when lm_weight_use_scheduler=false)
     lm_warmup_steps: 0
-    ema_schedule: [0.99, 0.9995]
+    ema_schedule: [0.99, 0.9998]
 
     run_baseline: false
 

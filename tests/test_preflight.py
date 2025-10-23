@@ -168,8 +168,10 @@ def test_bf16_mixed_precision_one_step_cuda():
 
     jepa_cfg = dict(
         latent_dim=64, predictor_hidden_multiplier=1.0, horizons=[2, 4], horizon_probs=[0.5, 0.5],
-        pairs_per_seq=8, ema_momentum=0.996, gamma_var=1.0, gamma_cov=1.0, tap_layer=-1,
-        grad_barrier=True, tap_norm=True, jepa_weight=1.0, lm_weight=0.5, lm_weight_use_scheduler=False,
+        pairs_per_seq=8, ema_momentum=0.996,
+        loss_type="barlow", off_diag_scale=0.02, align_scale=1.0,
+        tap_layer=-1, grad_barrier=True, tap_norm=True, jepa_weight=0.1,
+        lm_weight=0.5, lm_weight_use_scheduler=False,
     )
     model = LitJEPA(
         vocab_size=2048, d_model=64, n_layers=2, n_heads=4, dropout=0.0, ff_multiplier=2,

@@ -64,11 +64,10 @@ class LitJEPA(L.LightningModule):
             horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.25, 0.15, 0.06, 0.04]),
             pairs_per_seq=jepa_cfg.get("pairs_per_seq", 64),
             ema_momentum=jepa_cfg.get("ema_momentum", 0.996),
-            gamma_var=jepa_cfg.get("gamma_var", 1.0),
-            gamma_cov=jepa_cfg.get("gamma_cov", 0.2),
             dropout=dropout,
-            gamma_var_pred=jepa_cfg.get("gamma_var_pred", 0.0),
-            gamma_cov_pred=jepa_cfg.get("gamma_cov_pred", 0.0),
+            loss_type=jepa_cfg.get("loss_type", "barlow"),
+            off_diag_scale=jepa_cfg.get("off_diag_scale", 0.01),
+            align_scale=jepa_cfg.get("align_scale", 1.0),
         )
 
         # JEPA/LM weights
@@ -192,11 +191,10 @@ class LitJEPA(L.LightningModule):
         self.log("train/lm_loss", lm_loss, on_step=True)
 
         metric_names = [
-            "invariance_loss",
-            "variance_anchor",
-            "variance_pred",
-            "covariance_anchor",
-            "covariance_pred",
+            "align_loss",
+            "barlow_on_diag",
+            "barlow_off_diag",
+            "mse_pred_tgt",
             "std_anchor",
             "std_pred",
         ]
@@ -243,20 +241,18 @@ class LitJEPA(L.LightningModule):
         jepa_out = self.jepa(h_pred, pairs=pairs, teacher_h=h_teacher)
 
         zero = self._zero()
-        invariance = jepa_out.get("invariance_loss", zero)
-        var_anchor = jepa_out.get("variance_anchor", zero)
-        var_pred = jepa_out.get("variance_pred", zero)
-        cov_anchor = jepa_out.get("covariance_anchor", zero)
-        cov_pred = jepa_out.get("covariance_pred", zero)
+        align_loss = jepa_out.get("align_loss", zero)
+        barlow_diag = jepa_out.get("barlow_on_diag", zero)
+        barlow_off = jepa_out.get("barlow_off_diag", zero)
+        mse_pred_tgt = jepa_out.get("mse_pred_tgt", zero)
         std_anchor = jepa_out.get("std_anchor", zero)
         std_pred = jepa_out.get("std_pred", zero)
 
         metrics = {
-            "invariance_loss": invariance,
-            "variance_anchor": var_anchor,
-            "variance_pred": var_pred,
-            "covariance_anchor": cov_anchor,
-            "covariance_pred": cov_pred,
+            "align_loss": align_loss,
+            "barlow_on_diag": barlow_diag,
+            "barlow_off_diag": barlow_off,
+            "mse_pred_tgt": mse_pred_tgt,
             "std_anchor": std_anchor,
             "std_pred": std_pred,
             "std_gap": std_pred - std_anchor,
@@ -264,9 +260,59 @@ class LitJEPA(L.LightningModule):
         }
 
         return jepa_out, jepa_out.get("loss", zero), metrics
+
+    @torch.no_grad()
+    def _validation_retrieval_eval(
+        self,
+        z_pred: torch.Tensor,
+        z_tgt: torch.Tensor,
+        k_ids: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute retrieval-style diagnostics (Top-1 accuracy, margin)."""
+        if z_pred.numel() == 0:
+            zero = self._zero()
+            return {"top1_acc": zero, "margin": zero}
+
+        p = F.normalize(z_pred, dim=-1)
+        y = F.normalize(z_tgt, dim=-1)
+
+        unique_hids = torch.unique(k_ids)
+        total_n = 0
+        correct_sum = 0.0
+        dtrue_sum = 0.0
+        dneg_sum = 0.0
+
+        for hid in unique_hids:
+            horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
+            n_h = int(horizon_idx.numel())
+            if n_h < 2:
+                continue
+
+            p_h, y_h = p[horizon_idx], y[horizon_idx]
+            sim = p_h @ y_h.T
+            pos_sim = sim.diag()
+
+            sim_neg = sim.clone()
+            sim_neg.fill_diagonal_(-float("inf"))
+            max_neg_sim, _ = sim_neg.max(dim=1)
+
+            correct_sum += (pos_sim > max_neg_sim).float().sum().item()
+            dtrue_sum += (1.0 - pos_sim).sum().item()
+            dneg_sum += (1.0 - max_neg_sim).sum().item()
+            total_n += n_h
+
+        if total_n > 0:
+            top1_acc = self._scalar(correct_sum / total_n)
+            margin = self._scalar((dneg_sum / total_n) - (dtrue_sum / total_n))
+        else:
+            top1_acc = self._zero()
+            margin = self._zero()
+
+        return {"top1_acc": top1_acc, "margin": margin}
     
     def validation_step(self, batch, batch_idx):
         x = batch
+        B, T = x.shape[:2]
         use_jepa = self._is_jepa_active()
 
         zero = self._zero()
@@ -277,36 +323,42 @@ class LitJEPA(L.LightningModule):
 
             if use_jepa:
                 jepa_out, jepa_loss, metrics = self._validation_jepa_eval(h_pred, h_teacher, x)
+
+                val_pairs = self._get_or_make_val_pairs(B, T, x.device)
+                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_pred, pairs=val_pairs, teacher_h=h_teacher)
+                metrics.update(self._validation_retrieval_eval(z_pred, z_tgt, k_ids))
             else:
                 jepa_out, jepa_loss, metrics = {}, zero, {
-                    "invariance_loss": zero,
-                    "variance_anchor": zero,
-                    "variance_pred": zero,
-                    "covariance_anchor": zero,
-                    "covariance_pred": zero,
+                    "align_loss": zero,
+                    "barlow_on_diag": zero,
+                    "barlow_off_diag": zero,
+                    "mse_pred_tgt": zero,
                     "std_anchor": zero,
                     "std_pred": zero,
                     "std_gap": zero,
                     "pair_count": zero,
+                    "top1_acc": zero,
+                    "margin": zero,
                 }
 
         self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
         metric_names = [
-            "invariance_loss",
-            "variance_anchor",
-            "variance_pred",
-            "covariance_anchor",
-            "covariance_pred",
+            "align_loss",
+            "barlow_on_diag",
+            "barlow_off_diag",
+            "mse_pred_tgt",
             "std_anchor",
             "std_pred",
             "std_gap",
             "pair_count",
+            "top1_acc",
+            "margin",
         ]
 
         for name in metric_names:
             value = metrics.get(name, zero)
-            prog_bar = name == "invariance_loss"
+            prog_bar = name in ("align_loss", "top1_acc")
             self.log(f"val/{name}", value, on_epoch=True, sync_dist=True, prog_bar=prog_bar)
 
         self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)

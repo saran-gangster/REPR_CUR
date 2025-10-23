@@ -23,16 +23,18 @@ model:
     horizons: [2, 8, 32, 64]
     horizon_probs: [0.4, 0.3, 0.2, 0.1]
     ema_momentum: 0.996
-    gamma_var: 1.0
-    gamma_cov: 1.0
+    loss_type: barlow
+    off_diag_scale: 0.02
+    align_scale: 1.0
     tap_layer: -4
     tap_norm: true
     grad_barrier: true
     simple_recurrence_steps: 0
     recur_at: -4
-    jepa_weight: 1.0
+    jepa_weight: 0.1
     lm_weight: 0.75
     lm_weight_use_scheduler: false
+    ema_schedule: [0.99, 0.9998]
 
   optimizer:
     lr: 1.0e-4

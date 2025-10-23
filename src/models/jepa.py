@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.utils.sampling import sample_anchor_target_pairs
-from src.utils.vicreg import variance_loss, covariance_loss
 from src.utils.ema import update_ema_
 
 class MLP(nn.Module):
@@ -30,20 +29,18 @@ class JEPAObjective(nn.Module):
         horizon_probs: List[float] = [0.5, 0.3, 0.2],
         pairs_per_seq: int = 64,
         ema_momentum: float = 0.996,
-        gamma_var: float = 1.0,
-        gamma_cov: float = 1.0,
         dropout: float = 0.0,
-        gamma_var_pred: float = 0.0,
-        gamma_cov_pred: float = 0.0,
+        loss_type: str = "barlow",
+        off_diag_scale: float = 0.01,
+        align_scale: float = 1.0,
     ):
         super().__init__()
         assert len(horizons) == len(horizon_probs)
         self.pairs_per_seq = pairs_per_seq
         self.ema_momentum = ema_momentum
-        self.gamma_var = gamma_var
-        self.gamma_cov = gamma_cov
-        self.gamma_var_pred = gamma_var_pred
-        self.gamma_cov_pred = gamma_cov_pred
+        self.loss_type = loss_type
+        self.off_diag_scale = off_diag_scale
+        self.align_scale = align_scale
 
         # Register sampling buffers
         probs = torch.tensor(horizon_probs, dtype=torch.float)
@@ -69,6 +66,37 @@ class JEPAObjective(nn.Module):
                              hidden_mult=predictor_hidden_multiplier, dropout=dropout)
 
         self._init_target_from_online()
+
+    def _barlow_loss(
+        self,
+        z_a: torch.Tensor,
+        z_b: torch.Tensor,
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute standard Barlow Twins loss with internal batch normalisation."""
+        if z_a.numel() == 0:
+            zero = z_a.new_zeros(())
+            return zero, zero, zero
+
+        N, D = z_a.shape
+        if N <= 1:
+            zero = z_a.new_zeros(())
+            return zero, zero, zero
+
+        a_norm = (z_a - z_a.mean(dim=0, keepdim=True)) / (z_a.std(dim=0, unbiased=False, keepdim=True) + eps)
+        b_norm = (z_b - z_b.mean(dim=0, keepdim=True)) / (z_b.std(dim=0, unbiased=False, keepdim=True) + eps)
+
+        c = (a_norm.T @ b_norm) / float(N)
+
+        on_diag = (1.0 - torch.diagonal(c)).pow(2).mean()
+
+        if D <= 1:
+            off_diag = c.new_zeros(())
+        else:
+            off_diag = (c.pow(2).sum() - torch.diagonal(c).pow(2).sum()) / (D * (D - 1))
+
+        loss = self.align_scale * on_diag + self.off_diag_scale * off_diag
+        return loss, on_diag, off_diag
 
     def _init_target_from_online(self):
         with torch.no_grad():
@@ -149,31 +177,21 @@ class JEPAObjective(nn.Module):
         # predictor in latent space
         z_pred = self.predictor(torch.cat([z_anchor, z_k], dim=-1))  # (N, D_latent)
 
-        # VICReg components
         if z_pred.numel() == 0:
             zero = z_pred.new_zeros(())
-            invariance = zero
-            var_anchor = zero
-            cov_anchor = zero
-            var_pred = zero
-            cov_pred = zero
             loss = zero
+            align_loss = zero
+            barlow_diag = zero
+            barlow_off = zero
+            mse_pred_tgt = zero
         else:
-            invariance = F.mse_loss(z_pred, z_tgt)
+            if getattr(self, "loss_type", "barlow") == "barlow":
+                align_loss, barlow_diag, barlow_off = self._barlow_loss(z_pred, z_tgt)
+            else:
+                raise ValueError(f"Unsupported JEPA loss_type: {self.loss_type}")
 
-            var_anchor = variance_loss(z_anchor)
-            cov_anchor = covariance_loss(z_anchor)
-
-            var_pred = variance_loss(z_pred)
-            cov_pred = covariance_loss(z_pred)
-
-            loss = invariance
-            loss = loss + self.gamma_var * var_anchor
-            loss = loss + self.gamma_cov * cov_anchor
-            if self.gamma_var_pred > 0.0:
-                loss = loss + self.gamma_var_pred * var_pred
-            if self.gamma_cov_pred > 0.0:
-                loss = loss + self.gamma_cov_pred * cov_pred
+            loss = align_loss
+            mse_pred_tgt = F.mse_loss(z_pred, z_tgt).detach()
 
         # Keep only essential diagnostics
         std_anchor = z_anchor.std(dim=0, unbiased=False).mean()
@@ -181,11 +199,10 @@ class JEPAObjective(nn.Module):
 
         out = {
             "loss": loss,
-            "invariance_loss": invariance.detach(),
-            "variance_anchor": var_anchor.detach(),
-            "variance_pred": var_pred.detach(),
-            "covariance_anchor": cov_anchor.detach(),
-            "covariance_pred": cov_pred.detach(),
+            "align_loss": align_loss.detach(),
+            "barlow_on_diag": barlow_diag.detach(),
+            "barlow_off_diag": barlow_off.detach(),
+            "mse_pred_tgt": mse_pred_tgt,
             "std_anchor": std_anchor.detach(),
             "std_pred": std_pred.detach(),
         }

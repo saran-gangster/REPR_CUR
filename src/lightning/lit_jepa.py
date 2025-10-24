@@ -73,12 +73,14 @@ class LitJEPA(L.LightningModule):
         # JEPA/LM weights
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
         self.lm_weight_final = float(jepa_cfg.get("lm_weight", 1.0))
+        self.kl_future_weight = float(jepa_cfg.get("kl_future_weight", 0.0))
 
         # Baseline toggle (disables JEPA)
         self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
         if self.run_baseline:
             self.jepa_weight = 0.0
             self.lm_weight_final = 1.0
+            self.kl_future_weight = 0.0
 
         # LM weight scheduling
         self.lm_weight_use_scheduler = bool(jepa_cfg.get("lm_weight_use_scheduler", not self.run_baseline))
@@ -178,15 +180,37 @@ class LitJEPA(L.LightningModule):
 
         lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else self._zero()
 
+        kl_future = self._zero()
         if use_jepa:
-            jepa_out = self.jepa(h_pred, teacher_h=h_teacher)
+            return_latents = self.kl_future_weight > 0.0
+            jepa_out = self.jepa(h_pred, teacher_h=h_teacher, return_latents=return_latents)
             jepa_loss = jepa_out["loss"]
+
+            if return_latents:
+                z_pred = jepa_out.get("z_pred", None)
+                pairs = jepa_out.get("pairs", None)
+
+                if z_pred is not None and pairs is not None and z_pred.numel() > 0:
+                    b_idx, _, tpos, _ = pairs
+                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()
+                    if logits_next.size(1) > 0:
+                        gather_pos = (tpos - 1).clamp(min=0, max=logits_next.size(1) - 1)
+                        teacher_logits = logits_next[b_idx, gather_pos, :]
+                        p_teacher = torch.softmax(teacher_logits, dim=-1)
+
+                        h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
+                        student_logits = self._lm_logits(h_pred_vocab)
+                        q_student = F.log_softmax(student_logits, dim=-1)
+
+                        kl_future = F.kl_div(q_student, p_teacher, reduction="batchmean")
         else:
             jepa_out = {}
             jepa_loss = self._zero()
 
         eff_lm_w = self._current_lm_weight(self.global_step)
         total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
+        if self.kl_future_weight > 0.0 and use_jepa:
+            total_loss = total_loss + self.kl_future_weight * kl_future
 
         self.log("train/lm_loss", lm_loss, on_step=True)
 
@@ -209,12 +233,14 @@ class LitJEPA(L.LightningModule):
             g = torch.sigmoid(self.model.lm_bridge_gate)
             self.log("train/bridge_gate", g, on_step=True)
             self.log("train/recur_steps", self._scalar(self.recur_steps), on_step=True)
+            self.log("train/kl_future", kl_future, on_step=True)
         else:
             zero = self._zero()
             self.log("train/jepa_loss", zero, on_step=True)
             for name in metric_names:
                 self.log(f"train/{name}", zero, on_step=True)
             self.log("train/std_gap", zero, on_step=True)
+            self.log("train/kl_future", zero, on_step=True)
 
         return total_loss
     
@@ -321,12 +347,29 @@ class LitJEPA(L.LightningModule):
             (h_pred, h_teacher), h_final = self._forward_transformer(x, use_jepa=use_jepa)
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else self._zero()
 
+            kl_future = zero
             if use_jepa:
                 jepa_out, jepa_loss, metrics = self._validation_jepa_eval(h_pred, h_teacher, x)
 
                 val_pairs = self._get_or_make_val_pairs(B, T, x.device)
                 z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_pred, pairs=val_pairs, teacher_h=h_teacher)
                 metrics.update(self._validation_retrieval_eval(z_pred, z_tgt, k_ids))
+
+                if self.kl_future_weight > 0.0 and z_pred.numel() > 0:
+                    b_idx, _, tpos, _ = val_pairs
+                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()
+                    if logits_next.size(1) > 0:
+                        gather_pos = (tpos - 1).clamp(min=0, max=logits_next.size(1) - 1)
+                        teacher_logits = logits_next[b_idx, gather_pos, :]
+                        p_teacher = torch.softmax(teacher_logits, dim=-1)
+
+                        h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
+                        student_logits = self._lm_logits(h_pred_vocab)
+                        q_student = F.log_softmax(student_logits, dim=-1)
+
+                        kl_future = F.kl_div(q_student, p_teacher, reduction="batchmean")
+
+                metrics["kl_future"] = kl_future
             else:
                 jepa_out, jepa_loss, metrics = {}, zero, {
                     "align_loss": zero,
@@ -340,6 +383,7 @@ class LitJEPA(L.LightningModule):
                     "top1_acc": zero,
                     "margin": zero,
                 }
+                metrics["kl_future"] = zero
 
         self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
@@ -354,6 +398,7 @@ class LitJEPA(L.LightningModule):
             "pair_count",
             "top1_acc",
             "margin",
+            "kl_future",
         ]
 
         for name in metric_names:
@@ -500,6 +545,7 @@ class LitJEPA(L.LightningModule):
         add_head_params(self.jepa.online_proj.parameters())
         add_head_params(self.jepa.predictor.parameters())
         add_head_params(self.jepa.horizon_emb_latent.parameters())
+        add_head_params(self.jepa.latent_to_hidden.parameters())
 
         if self.model.weight_tying:
             add_head_params(self.model.token_emb.parameters())

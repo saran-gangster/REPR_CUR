@@ -34,6 +34,7 @@ model:
     jepa_weight: 0.1
     lm_weight: 0.75
     lm_weight_use_scheduler: false
+    kl_future_weight: 0.25
     ema_schedule: [0.99, 0.9998]
 
   optimizer:

@@ -65,6 +65,13 @@ class JEPAObjective(nn.Module):
         self.predictor = MLP(in_dim=2 * latent_dim, out_dim=latent_dim,
                              hidden_mult=predictor_hidden_multiplier, dropout=dropout)
 
+        self.latent_to_hidden = MLP(
+            in_dim=latent_dim,
+            out_dim=d_model,
+            hidden_mult=1.5,
+            dropout=dropout,
+        )
+
         self._init_target_from_online()
 
     def _barlow_loss(

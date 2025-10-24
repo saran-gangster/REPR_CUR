@@ -29,7 +29,7 @@ model:
     pairs_per_seq: 64
     ema_momentum: 0.995
     loss_type: barlow
-    off_diag_scale: 0.02
+    off_diag_scale: 0.005
     align_scale: 1.0
     tap_layer: -3
     grad_barrier: true
@@ -40,6 +40,7 @@ model:
     jepa_weight: 0.1
     lm_weight: 0.5
     lm_weight_use_scheduler: false
+    kl_future_weight: 0.25
 
     # (ignored when lm_weight_use_scheduler=false)
     lm_warmup_steps: 0

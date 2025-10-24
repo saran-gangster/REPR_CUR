@@ -35,6 +35,8 @@ model:
     lm_weight: 0.75
     lm_weight_use_scheduler: false
     kl_future_weight: 0.25
+    kl_temp: 2.0
+    freeze_lm_head_for_kl: true
     ema_schedule: [0.99, 0.9998]
 
   optimizer:

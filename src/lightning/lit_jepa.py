@@ -74,6 +74,10 @@ class LitJEPA(L.LightningModule):
         self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
         self.lm_weight_final = float(jepa_cfg.get("lm_weight", 1.0))
         self.kl_future_weight = float(jepa_cfg.get("kl_future_weight", 0.0))
+        # KL distillation controls
+        self.kl_temp = float(jepa_cfg.get("kl_temp", 2.0))
+        self.freeze_lm_head_for_kl = bool(jepa_cfg.get("freeze_lm_head_for_kl", True))
+        self.kl_weight_warmup_steps = int(jepa_cfg.get("kl_weight_warmup_steps", 0))
 
         # Baseline toggle (disables JEPA)
         self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
@@ -114,6 +118,33 @@ class LitJEPA(L.LightningModule):
             b = getattr(self.model, "output_bias", None)
             if b is not None:
                 logits = logits + b
+        return logits
+
+    def _student_logits_from_latent(self, h_latent: torch.Tensor) -> torch.Tensor:
+        """Compute student logits from latent->hidden mapping without updating LM head.
+
+        - Detaches LM head weights (and tied extras) so gradients flow only
+          through the latent_to_hidden mapper.
+        - Falls back to standard lm_head if freezing is disabled.
+        """
+        if not self.freeze_lm_head_for_kl:
+            return self._lm_logits(h_latent)
+
+        # Build logits with detached head weights/bias/scale
+        with torch.no_grad():
+            W = self.model.lm_head.weight.detach()
+            b = getattr(self.model, "output_bias", None)
+            if b is not None:
+                b = b.detach()
+            ls = getattr(self.model, "logit_scale", None)
+            if ls is not None:
+                ls_val = float(ls.detach())
+            else:
+                ls_val = 1.0
+
+        logits = torch.nn.functional.linear(h_latent, W, b)
+        if ls_val != 1.0:
+            logits = logits * ls_val
         return logits
 
     def _is_jepa_active(self) -> bool:
@@ -166,6 +197,16 @@ class LitJEPA(L.LightningModule):
         frac = max(0.0, min(1.0, frac))
         return float(self.lm_weight_final) * frac
 
+    def _current_kl_weight(self, step: int) -> float:
+        if self.kl_future_weight <= 0.0:
+            return 0.0
+        warm = max(0, self.kl_weight_warmup_steps)
+        if warm <= 0:
+            return float(self.kl_future_weight)
+        if step < warm:
+            return float(self.kl_future_weight) * (float(step) / max(1, warm))
+        return float(self.kl_future_weight)
+
     def _current_ema_momentum(self, step: int) -> float:
         if self.ema_sched_steps <= 0 or self.ema_start == self.ema_end:
             return self.jepa.ema_momentum
@@ -181,6 +222,8 @@ class LitJEPA(L.LightningModule):
         lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else self._zero()
 
         kl_future = self._zero()
+        ce_future = self._zero()
+        teacher_entropy = self._zero()
         if use_jepa:
             return_latents = self.kl_future_weight > 0.0
             jepa_out = self.jepa(h_pred, teacher_h=h_teacher, return_latents=return_latents)
@@ -192,25 +235,34 @@ class LitJEPA(L.LightningModule):
 
                 if z_pred is not None and pairs is not None and z_pred.numel() > 0:
                     b_idx, _, tpos, _ = pairs
-                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()
+                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()  # (B, T-1, V)
                     if logits_next.size(1) > 0:
-                        gather_pos = (tpos - 1).clamp(min=0, max=logits_next.size(1) - 1)
-                        teacher_logits = logits_next[b_idx, gather_pos, :]
-                        p_teacher = torch.softmax(teacher_logits, dim=-1)
+                        # Align on tpos (predicting x[tpos+1]); mask out tpos == T-1
+                        valid = (tpos < logits_next.size(1))
+                        if valid.any():
+                            idx = valid.nonzero(as_tuple=True)[0]
+                            Ttemp = float(getattr(self, "kl_temp", 2.0))
+                            teacher_logits = logits_next[b_idx[idx], tpos[idx], :]
+                            log_p_teacher_T = F.log_softmax(teacher_logits / Ttemp, dim=-1)
+                            p_teacher_T = log_p_teacher_T.exp()
 
-                        h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
-                        student_logits = self._lm_logits(h_pred_vocab)
-                        q_student = F.log_softmax(student_logits, dim=-1)
+                            h_pred_vocab = self.jepa.latent_to_hidden(z_pred[idx])
+                            student_logits = self._student_logits_from_latent(h_pred_vocab)
+                            log_q_student_T = F.log_softmax(student_logits / Ttemp, dim=-1)
 
-                        kl_future = F.kl_div(q_student, p_teacher, reduction="batchmean")
+                            # Decompose CE and teacher entropy; KL via T^2 scaling
+                            ce_future = -(p_teacher_T * log_q_student_T).sum(dim=-1).mean()
+                            teacher_entropy = -(p_teacher_T * log_p_teacher_T).sum(dim=-1).mean()
+                            kl_future = (ce_future - teacher_entropy) * (Ttemp * Ttemp)
         else:
             jepa_out = {}
             jepa_loss = self._zero()
 
         eff_lm_w = self._current_lm_weight(self.global_step)
+        eff_kl_w = self._current_kl_weight(self.global_step)
         total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
-        if self.kl_future_weight > 0.0 and use_jepa:
-            total_loss = total_loss + self.kl_future_weight * kl_future
+        if eff_kl_w > 0.0 and use_jepa:
+            total_loss = total_loss + eff_kl_w * kl_future
 
         self.log("train/lm_loss", lm_loss, on_step=True)
 
@@ -234,6 +286,10 @@ class LitJEPA(L.LightningModule):
             self.log("train/bridge_gate", g, on_step=True)
             self.log("train/recur_steps", self._scalar(self.recur_steps), on_step=True)
             self.log("train/kl_future", kl_future, on_step=True)
+            self.log("train/ce_future", ce_future, on_step=True)
+            self.log("train/teacher_entropy", teacher_entropy, on_step=True)
+            if self.kl_weight_warmup_steps > 0:
+                self.log("train/kl_future_weight_eff", self._scalar(eff_kl_w), on_step=True)
         else:
             zero = self._zero()
             self.log("train/jepa_loss", zero, on_step=True)
@@ -241,6 +297,8 @@ class LitJEPA(L.LightningModule):
                 self.log(f"train/{name}", zero, on_step=True)
             self.log("train/std_gap", zero, on_step=True)
             self.log("train/kl_future", zero, on_step=True)
+            self.log("train/ce_future", zero, on_step=True)
+            self.log("train/teacher_entropy", zero, on_step=True)
 
         return total_loss
     
@@ -348,6 +406,8 @@ class LitJEPA(L.LightningModule):
             lm_loss = self._lm_loss(h_final, x) if self.lm_weight_final > 0.0 else self._zero()
 
             kl_future = zero
+            ce_future = zero
+            teacher_H = zero
             if use_jepa:
                 jepa_out, jepa_loss, metrics = self._validation_jepa_eval(h_pred, h_teacher, x)
 
@@ -357,19 +417,27 @@ class LitJEPA(L.LightningModule):
 
                 if self.kl_future_weight > 0.0 and z_pred.numel() > 0:
                     b_idx, _, tpos, _ = val_pairs
-                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()
+                    logits_next = self._lm_logits(h_final[:, :-1, :]).detach()  # (B, T-1, V)
                     if logits_next.size(1) > 0:
-                        gather_pos = (tpos - 1).clamp(min=0, max=logits_next.size(1) - 1)
-                        teacher_logits = logits_next[b_idx, gather_pos, :]
-                        p_teacher = torch.softmax(teacher_logits, dim=-1)
+                        valid = (tpos < logits_next.size(1))
+                        if valid.any():
+                            idx = valid.nonzero(as_tuple=True)[0]
+                            Ttemp = float(getattr(self, "kl_temp", 2.0))
+                            teacher_logits = logits_next[b_idx[idx], tpos[idx], :]
+                            log_p_teacher_T = F.log_softmax(teacher_logits / Ttemp, dim=-1)
+                            p_teacher_T = log_p_teacher_T.exp()
 
-                        h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
-                        student_logits = self._lm_logits(h_pred_vocab)
-                        q_student = F.log_softmax(student_logits, dim=-1)
+                            h_pred_vocab = self.jepa.latent_to_hidden(z_pred[idx])
+                            student_logits = self._student_logits_from_latent(h_pred_vocab)
+                            log_q_student_T = F.log_softmax(student_logits / Ttemp, dim=-1)
 
-                        kl_future = F.kl_div(q_student, p_teacher, reduction="batchmean")
+                            ce_future = -(p_teacher_T * log_q_student_T).sum(dim=-1).mean()
+                            teacher_H = -(p_teacher_T * log_p_teacher_T).sum(dim=-1).mean()
+                            kl_future = (ce_future - teacher_H) * (Ttemp * Ttemp)
 
                 metrics["kl_future"] = kl_future
+                metrics["ce_future"] = ce_future
+                metrics["teacher_entropy"] = teacher_H
             else:
                 jepa_out, jepa_loss, metrics = {}, zero, {
                     "align_loss": zero,
@@ -384,6 +452,8 @@ class LitJEPA(L.LightningModule):
                     "margin": zero,
                 }
                 metrics["kl_future"] = zero
+                metrics["ce_future"] = zero
+                metrics["teacher_entropy"] = zero
 
         self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
 
@@ -399,6 +469,8 @@ class LitJEPA(L.LightningModule):
             "top1_acc",
             "margin",
             "kl_future",
+            "ce_future",
+            "teacher_entropy",
         ]
 
         for name in metric_names:

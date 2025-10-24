@@ -41,6 +41,8 @@ model:
     lm_weight: 0.5
     lm_weight_use_scheduler: false
     kl_future_weight: 0.25
+    kl_temp: 2.0
+    freeze_lm_head_for_kl: true
 
     # (ignored when lm_weight_use_scheduler=false)
     lm_warmup_steps: 0

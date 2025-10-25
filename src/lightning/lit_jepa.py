@@ -36,6 +36,7 @@ class LitJEPA(L.LightningModule):
         use_rope: bool = True,
         rope_base: float = 10000,
         weight_tying: bool = True,
+        lm_bridge_enabled: bool = True,
         jepa: Dict[str, Any] = None,
         optimizer: Dict[str, Any] = None,
     ):
@@ -43,6 +44,7 @@ class LitJEPA(L.LightningModule):
         self.save_hyperparameters(ignore=['optimizer'])
 
         jepa_cfg = jepa or {}
+        self.lm_bridge_enabled = bool(lm_bridge_enabled)
 
         # Transformer
         self.simple_recurrence_steps = int(jepa_cfg.get("simple_recurrence_steps", 0))
@@ -52,6 +54,7 @@ class LitJEPA(L.LightningModule):
             dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base,
             weight_tying=weight_tying,
             simple_recurrence_steps=0,
+            lm_bridge_enabled=self.lm_bridge_enabled,
         )
         self.model.simple_recurrence_steps = self.simple_recurrence_steps
 
@@ -282,7 +285,11 @@ class LitJEPA(L.LightningModule):
             std_anchor = jepa_out.get("std_anchor", self._zero())
             std_pred = jepa_out.get("std_pred", self._zero())
             self.log("train/std_gap", std_pred - std_anchor, on_step=True)
-            g = torch.sigmoid(self.model.lm_bridge_gate)
+            bridge_gate = getattr(self.model, "lm_bridge_gate", None)
+            if bridge_gate is not None:
+                g = torch.sigmoid(bridge_gate)
+            else:
+                g = self._zero()
             self.log("train/bridge_gate", g, on_step=True)
             self.log("train/recur_steps", self._scalar(self.recur_steps), on_step=True)
             self.log("train/kl_future", kl_future, on_step=True)
@@ -502,10 +509,15 @@ class LitJEPA(L.LightningModule):
                     p.requires_grad = False
                 for p in self.model.norm_tap.parameters():
                     p.requires_grad = False
-                for p in self.model.lm_bridge.parameters():
-                    p.requires_grad = False
-                if hasattr(self.model, "lm_bridge_gate") and self.model.lm_bridge_gate is not None:
-                    self.model.lm_bridge_gate.requires_grad = False
+                    lm_bridge_module = getattr(self.model, "lm_bridge", None)
+                    bridge_gate = getattr(self.model, "lm_bridge_gate", None)
+
+                    if lm_bridge_module is not None:
+                        for p in lm_bridge_module.parameters():
+                            p.requires_grad = False
+
+                    if bridge_gate is not None:
+                        bridge_gate.requires_grad = False
             else:
                 if not self.jepa_tap_norm and hasattr(self.model, "norm_tap"):
                     for p in self.model.norm_tap.parameters():
@@ -721,7 +733,9 @@ class LitJEPA(L.LightningModule):
             lower_params += list(self.model.norm_tap.parameters())
 
             # Upper: LM-only modules
-            upper_params += list(self.model.lm_bridge.parameters())
+            lm_bridge_module = getattr(self.model, "lm_bridge", None)
+            if lm_bridge_module is not None:
+                upper_params += list(lm_bridge_module.parameters())
             upper_params += list(self.model.norm_f.parameters())
             upper_params += list(self.model.lm_head.parameters())
 

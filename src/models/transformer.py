@@ -97,8 +97,9 @@ class DecoderOnlyTransformer(nn.Module):
         ff_multiplier: int = 4,
         use_rope: bool = True,
         rope_base: float = 10000.0,
-        weight_tying: bool = False,
-        simple_recurrence_steps: int = 0,
+    weight_tying: bool = False,
+    simple_recurrence_steps: int = 0,
+    lm_bridge_enabled: bool = True,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -112,6 +113,7 @@ class DecoderOnlyTransformer(nn.Module):
 
         self.weight_tying = bool(weight_tying)
         self.simple_recurrence_steps = max(0, int(simple_recurrence_steps))
+        self.lm_bridge_enabled = bool(lm_bridge_enabled)
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         if self.weight_tying:
@@ -124,14 +126,18 @@ class DecoderOnlyTransformer(nn.Module):
         self.norm_tap = RMSNorm(d_model)
 
         # LM-only bridge on the upper stack
-        self.lm_bridge = nn.Sequential(
-            RMSNorm(d_model),
-            nn.Linear(d_model, d_model, bias=True),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model, bias=True),
-        )
-        self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
+        if self.lm_bridge_enabled:
+            self.lm_bridge = nn.Sequential(
+                RMSNorm(d_model),
+                nn.Linear(d_model, d_model, bias=True),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model, bias=True),
+            )
+            self.lm_bridge_gate = nn.Parameter(torch.tensor(-2.0))
+        else:
+            self.lm_bridge = None
+            self.register_parameter("lm_bridge_gate", None)
 
     def tap_index(self, tap_layer: Optional[int]) -> Optional[int]:
         if tap_layer is None:
@@ -174,7 +180,8 @@ class DecoderOnlyTransformer(nn.Module):
         h_tap_original = None
         h_tap_recurrent = None
 
-        g = torch.sigmoid(self.lm_bridge_gate)
+        bridge_active = self.lm_bridge_enabled and self.lm_bridge is not None and self.lm_bridge_gate is not None
+        g = torch.sigmoid(self.lm_bridge_gate) if bridge_active else None
 
         for i, blk in enumerate(self.blocks):
             x = blk(x)
@@ -186,8 +193,11 @@ class DecoderOnlyTransformer(nn.Module):
                 if grad_barrier:
                     x_for_upper = x_for_upper.detach()
 
-                # Existing LM-only bridge
-                x = x_for_upper + g * self.lm_bridge(x_for_upper)
+                if bridge_active:
+                    # Existing LM-only bridge
+                    x = x_for_upper + g * self.lm_bridge(x_for_upper)
+                else:
+                    x = x_for_upper
 
         h_final = self.norm_f(x)
 

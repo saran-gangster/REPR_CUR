@@ -122,9 +122,17 @@ def test_ema_update_moves_target_towards_online():
 # -----------------------------------------------
 
 @pytest.mark.parametrize("T", [64, 256, 512])
-def test_transformer_rope_forward_and_causality(T: int):
+@pytest.mark.parametrize("lm_bridge_enabled", [True, False])
+def test_transformer_rope_forward_and_causality(T: int, lm_bridge_enabled: bool):
     _set_seed(2024)
-    model = DecoderOnlyTransformer(vocab_size=1024, d_model=64, n_layers=3, n_heads=8, use_rope=True).eval()
+    model = DecoderOnlyTransformer(
+        vocab_size=1024,
+        d_model=64,
+        n_layers=3,
+        n_heads=8,
+        use_rope=True,
+        lm_bridge_enabled=lm_bridge_enabled,
+    ).eval()
     x1 = torch.randint(0, 1024, (2, T), dtype=torch.long)
     x2 = x1.clone()
     cut = T // 2

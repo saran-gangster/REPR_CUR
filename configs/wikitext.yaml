@@ -17,6 +17,7 @@ model:
   use_rope: true
   rope_base: 10000
   weight_tying: false
+  lm_bridge_enabled: true
 
   jepa:
     latent_dim: 512

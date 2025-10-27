@@ -19,27 +19,43 @@ model:
   weight_tying: false
 
   jepa:
+    loss_type: soft_nce_psr
+
+    temperature: 0.15
+    teacher_kernel_temp: 0.25
+    neighbor_topk: 32
+    softnce_uncert_scale: 1.0
+
+    kappa_beta: 1.0
+    kappa_temp: 1.5
+
+    var_weight: 1.0
+    cycle_weight: 0.10
+    comp_weight: 0.05
+    pres_weight: 0.02
+
+    kl_future_weight: 0.25
+    kl_temp: 2.0
+    js_warmup_gamma: 2.0
+    freeze_lm_head_for_kl: true
+
     latent_dim: 512
     horizons: [2, 8, 32, 64]
     horizon_probs: [0.4, 0.3, 0.2, 0.1]
+    pairs_per_seq: 32
     ema_momentum: 0.996
-    loss_type: barlow
-    off_diag_scale: 0.02
-    align_scale: 1.0
+    ema_schedule: [0.99, 0.9999]
+
     tap_layer: -4
     tap_norm: true
     grad_barrier: true
-    jepa_weight: 0.1
-    lm_weight: 0.75
+
+    jepa_weight: 0.12
+    lm_weight: 0.6
     lm_weight_use_scheduler: false
-    kl_future_weight: 0.25
-    kl_temp: 2.0
-    freeze_lm_head_for_kl: true
-    ema_schedule: [0.99, 0.9998]
 
   optimizer:
     lr: 1.0e-4
-    lr_head: 1.0e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 1500

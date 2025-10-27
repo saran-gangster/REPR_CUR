@@ -30,11 +30,11 @@ model:
     kappa_temp: 1.5
 
     var_weight: 1.0
-    cycle_weight: 0.10
-    comp_weight: 0.05
-    pres_weight: 0.02
+    cycle_weight: 0.0
+    comp_weight: 0.0
+    pres_weight: 0.05
 
-    kl_future_weight: 0.25
+    kl_future_weight: 0.1
     kl_temp: 2.0
     js_warmup_gamma: 2.0
     freeze_lm_head_for_kl: true
@@ -50,12 +50,12 @@ model:
     tap_norm: true
     grad_barrier: true
 
-    jepa_weight: 0.12
-    lm_weight: 0.6
+    jepa_weight: 0.05
+    lm_weight: 0.8
     lm_weight_use_scheduler: false
 
   optimizer:
-    lr: 1.0e-4
+    lr: 1.5e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
     warmup_steps: 1500

@@ -4,7 +4,7 @@ This repo trains a JEPA-augmented decoder-only transformer via LightningCLI. Use
 
 ## Big picture
 - Entry point: `src/train.py` wires `LitJEPA` + `UnifiedDataModule` into LightningCLI and injects both TensorBoard and W&B loggers by default.
-- Core model: `src/models/transformer.py` implements an autoregressive stack with RMSNorm, SwiGLU MLPs, RoPE, and a gated `lm_bridge` residual path. Weight tying optionally exposes `logit_scale` and `output_bias`.
+- Core model: `src/models/transformer.py` implements an autoregressive stack with RMSNorm, SwiGLU MLPs, and RoPE. Weight tying optionally exposes `logit_scale` and `output_bias`.
 - JEPA objective: `src/models/jepa.py` provides online/EMA towers, predictor, horizon embeddings, and VICReg-style regularizers. Tap features come from an intermediate transformer layer.
 - Utilities: `src/utils/{sampling.py,vicreg.py,ema.py}` contain horizon pair sampling, variance/covariance penalties, and EMA update helpers.
 
@@ -24,7 +24,7 @@ This repo trains a JEPA-augmented decoder-only transformer via LightningCLI. Use
 	- EMA momentum can cosine-ramp via `jepa.ema_schedule` + `jepa.ema_schedule_steps`; JEPA momentum is updated every train batch.
 	- `jepa.lm_weight` can warm up if `jepa.lm_weight_use_scheduler: true` (defaults on unless `run_baseline`).
 - Optimizer grouping: heads (JEPA projector/predictor, horizon emb, LM head or tied token emb) get `lr_head`; backbone gets `lr`. Weight decay applies only to >=2D params. LR schedule = warmup+cosine per-step.
-- Gradient clipping is split at the tap: lower (token emb, blocks ≤ tap, norm_tap, JEPA heads) and upper (bridge/norm_f/lm_head) are clipped separately.
+- Gradient clipping is split at the tap: lower (token emb, blocks ≤ tap, norm_tap, JEPA heads) and upper (norm_f/lm_head) are clipped separately.
 - Auto vocab resize on `on_fit_start`: when the datamodule exposes `vocab_size`, token embedding and LM head are rebuilt and weight tying extras reinitialized.
 
 ## JEPA, horizons, and diagnostics

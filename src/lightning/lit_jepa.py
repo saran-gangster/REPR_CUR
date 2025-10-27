@@ -36,7 +36,6 @@ class LitJEPA(L.LightningModule):
         use_rope: bool = True,
         rope_base: float = 10000,
         weight_tying: bool = True,
-        lm_bridge_enabled: bool = True,
         jepa: Dict[str, Any] = None,
         optimizer: Dict[str, Any] = None,
     ):
@@ -44,19 +43,13 @@ class LitJEPA(L.LightningModule):
         self.save_hyperparameters(ignore=['optimizer'])
 
         jepa_cfg = jepa or {}
-        self.lm_bridge_enabled = bool(lm_bridge_enabled)
 
         # Transformer
-        self.simple_recurrence_steps = int(jepa_cfg.get("simple_recurrence_steps", 0))
-        self.recur_steps = self.simple_recurrence_steps
         self.model = DecoderOnlyTransformer(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
             dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base,
             weight_tying=weight_tying,
-            simple_recurrence_steps=0,
-            lm_bridge_enabled=self.lm_bridge_enabled,
         )
-        self.model.simple_recurrence_steps = self.simple_recurrence_steps
 
         # JEPA
         self.jepa = JEPAObjective(
@@ -97,8 +90,6 @@ class LitJEPA(L.LightningModule):
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
         self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
         self.jepa_tap_norm = bool(jepa_cfg.get("tap_norm", False))
-        self.recur_at = int(jepa_cfg.get("recur_at", self.jepa_tap_layer))
-
         # EMA schedule
         ema_sched = jepa_cfg.get("ema_schedule", None)
         if isinstance(ema_sched, (list, tuple)) and len(ema_sched) == 2:
@@ -167,7 +158,6 @@ class LitJEPA(L.LightningModule):
                 return_tap=True,
                 grad_barrier=self.jepa_grad_barrier,
                 tap_norm=self.jepa_tap_norm,
-                simple_recurrence_steps=self.recur_steps,
             )
 
         h_final = self.model(x, tap_layer=None, return_tap=False)
@@ -285,13 +275,6 @@ class LitJEPA(L.LightningModule):
             std_anchor = jepa_out.get("std_anchor", self._zero())
             std_pred = jepa_out.get("std_pred", self._zero())
             self.log("train/std_gap", std_pred - std_anchor, on_step=True)
-            bridge_gate = getattr(self.model, "lm_bridge_gate", None)
-            if bridge_gate is not None:
-                g = torch.sigmoid(bridge_gate)
-            else:
-                g = self._zero()
-            self.log("train/bridge_gate", g, on_step=True)
-            self.log("train/recur_steps", self._scalar(self.recur_steps), on_step=True)
             self.log("train/kl_future", kl_future, on_step=True)
             self.log("train/ce_future", ce_future, on_step=True)
             self.log("train/teacher_entropy", teacher_entropy, on_step=True)
@@ -509,15 +492,6 @@ class LitJEPA(L.LightningModule):
                     p.requires_grad = False
                 for p in self.model.norm_tap.parameters():
                     p.requires_grad = False
-                    lm_bridge_module = getattr(self.model, "lm_bridge", None)
-                    bridge_gate = getattr(self.model, "lm_bridge_gate", None)
-
-                    if lm_bridge_module is not None:
-                        for p in lm_bridge_module.parameters():
-                            p.requires_grad = False
-
-                    if bridge_gate is not None:
-                        bridge_gate.requires_grad = False
             else:
                 if not self.jepa_tap_norm and hasattr(self.model, "norm_tap"):
                     for p in self.model.norm_tap.parameters():
@@ -547,8 +521,8 @@ class LitJEPA(L.LightningModule):
 
                     # Rebuild tied softmax extras
                     if getattr(self.model, "weight_tying", False):
-                        import math
-                        self.model.logit_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(d_model), device=device))
+                        scale_init = float(getattr(self.model, "logit_scale_init", 1.0))
+                        self.model.logit_scale = nn.Parameter(torch.tensor(scale_init, device=device))
                         self.model.output_bias = nn.Parameter(torch.zeros(new_V, device=device))
                     else:
                         self.model.logit_scale = None
@@ -733,9 +707,6 @@ class LitJEPA(L.LightningModule):
             lower_params += list(self.model.norm_tap.parameters())
 
             # Upper: LM-only modules
-            lm_bridge_module = getattr(self.model, "lm_bridge", None)
-            if lm_bridge_module is not None:
-                upper_params += list(lm_bridge_module.parameters())
             upper_params += list(self.model.norm_f.parameters())
             upper_params += list(self.model.lm_head.parameters())
 

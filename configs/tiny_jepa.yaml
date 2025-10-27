@@ -26,18 +26,18 @@ model:
 
     temperature: 0.2
     teacher_kernel_temp: 0.3
-    neighbor_topk: 16
+    neighbor_topk: 32
     softnce_uncert_scale: 1.0
 
-    kappa_beta: 1.0
+    kappa_beta: 0.0
     kappa_temp: 1.5
 
     var_weight: 1.0
-    cycle_weight: 0.1
-    comp_weight: 0.05
-    pres_weight: 0.01
+    cycle_weight: 0.05
+    comp_weight: 0.01
+    pres_weight: 0.0
 
-    kl_future_weight: 0.25
+    kl_future_weight: 0.0
     kl_temp: 2.0
     js_warmup_gamma: 2.0
     freeze_lm_head_for_kl: true

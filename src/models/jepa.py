@@ -141,7 +141,7 @@ class JEPAObjective(nn.Module):
 
             logits_t = logits_t_raw / (row_scale[:, None] * max(1e-6, float(self.teacher_kernel_temp)))
 
-            if teacher_logits is None or teacher_logits.numel() == 0:
+            if self.kappa_beta <= 0.0 or teacher_logits is None or teacher_logits.numel() == 0:
                 kappa = torch.ones_like(logits_t)
             else:
                 p_teacher = torch.softmax(teacher_logits / max(1e-6, float(self.kappa_temp)), dim=-1)

@@ -49,7 +49,6 @@ model:
     pairs_per_seq: 32
     ema_momentum: 0.996
     ema_schedule: [0.99, 0.9998]
-    off_diag_scale: 0.02
     align_scale: 1.0
     tap_layer: -3
     grad_barrier: true

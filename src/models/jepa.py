@@ -104,7 +104,7 @@ class JEPAObjective(nn.Module):
     def _l2_norm(self, x: torch.Tensor) -> torch.Tensor:
         if not self.normalize_latents:
             return x
-        return torch.nn.functional.normalize(x, dim=-1)
+        return torch.nn.functional.normalize(x, dim=-1, eps=1e-8)
 
     def _cosine_mse(self, a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         if a.numel() == 0 or b.numel() == 0:
@@ -185,7 +185,11 @@ class JEPAObjective(nn.Module):
         if logQ is None:
             logQ = self._soft_targets(z_tgt, k_ids, teacher_logits)
 
-        loss = -(logQ.exp() * logP).sum(dim=1).mean()
+        # Guard against 0 * (-inf) -> NaN when rows include masked entries.
+        Q = logQ.exp()
+        finite_support = torch.isfinite(logQ)
+        logP = torch.where(finite_support, logP, torch.zeros_like(logP))
+        loss = -(Q * logP).sum(dim=1).mean()
 
         with torch.no_grad():
             diag_logits = torch.diagonal(logits.masked_fill(~mask, float("-inf")))

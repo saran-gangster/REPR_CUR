@@ -99,6 +99,11 @@ class LitJEPA(L.LightningModule):
         # JEPA weight (α)
         self.alpha = float(jepa_cfg.get("alpha", 0.1))
         
+        # Baseline mode: disable JEPA entirely when alpha=0 or run_baseline=True
+        self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
+        if self.run_baseline:
+            self.alpha = 0.0
+        
         # Tap layer for JEPA
         self.jepa_tap_layer = jepa_cfg.get("tap_layer", -3)
         self.jepa_tap_norm = bool(jepa_cfg.get("tap_norm", False))
@@ -148,6 +153,18 @@ class LitJEPA(L.LightningModule):
     
     def training_step(self, batch, batch_idx):
         x = batch  # (B, T)
+        
+        # Baseline mode: skip JEPA entirely
+        if self.alpha == 0.0 or self.run_baseline:
+            # Standard LM forward pass (no tap)
+            h_final = self.model(x)
+            logits_final = self._lm_logits(h_final)
+            lm_logits = logits_final[:, :-1, :]
+            lm_loss = self._lm_loss(lm_logits, x)
+            
+            self.log("train/lm_loss", lm_loss, on_step=True)
+            self.log("train/total_loss", lm_loss, on_step=True)
+            return lm_loss
         
         # Forward with tap for JEPA
         (h_tap, _), h_final = self._forward_with_tap(x)
@@ -213,6 +230,18 @@ class LitJEPA(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         x = batch
         B, T = x.shape
+        
+        # Baseline mode: skip JEPA entirely
+        if self.alpha == 0.0 or self.run_baseline:
+            # Standard LM forward pass (no tap)
+            h_final = self.model(x)
+            logits_final = self._lm_logits(h_final)
+            lm_logits = logits_final[:, :-1, :]
+            lm_loss = self._lm_loss(lm_logits, x)
+            
+            self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True, prog_bar=True)
+            self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
+            return
         
         # Forward with tap
         (h_tap, _), h_final = self._forward_with_tap(x)

@@ -1,0 +1,67 @@
+##################################################
+# Baseline LM config for WikiText-2
+# 
+# This config trains ONLY the language model
+# without any JEPA objective (run_baseline: true)
+# 
+# Use this for comparison with JEPA results
+##################################################
+
+seed_everything: 42
+
+trainer:
+  max_steps: 10000
+  log_every_n_steps: 50
+  val_check_interval: 500
+  gradient_clip_val: 1.0
+  precision: bf16-mixed
+  accelerator: auto
+  devices: auto
+  strategy: auto
+
+model:
+  vocab_size: 8192
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.1
+  ff_multiplier: 4
+  use_rope: true
+  rope_base: 10000
+  weight_tying: true
+
+  jepa:
+    # Baseline mode: disable JEPA entirely
+    run_baseline: true
+    
+    # These params are ignored in baseline mode but kept for compatibility
+    alpha: 0.0
+    geometry_lambda: 0.2
+    latent_dim: 512
+    predictor_hidden_multiplier: 2.0
+    horizons: [2, 8, 32, 64]
+    horizon_probs: [0.4, 0.3, 0.2, 0.1]
+    pairs_per_seq: 64
+    prediction_loss_type: cosine
+    geometry_regularizer: vicreg
+    vicreg_var_weight: 1.0
+    vicreg_cov_weight: 0.1
+    sigreg_num_directions: 128
+    tap_layer: -4
+    tap_norm: true
+
+  optimizer:
+    lr: 3.0e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 500
+
+data:
+  module: wikitext2
+  data_dir: data/
+  block_size: 512
+  batch_size: 64
+  num_workers: 4
+  train_fraction: 1.0
+  bpe_vocab_size: 8192
+  force_rebuild_tokenizer: false

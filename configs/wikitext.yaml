@@ -32,6 +32,9 @@ model:
   weight_tying: true
 
   jepa:
+    # Baseline mode: set run_baseline=true to disable JEPA entirely
+    run_baseline: false           # If true, trains LM-only (ignores alpha)
+    
     # Core hyperparameters (only 2!)
     alpha: 0.1                    # JEPA weight: total_loss = lm + α*jepa
     geometry_lambda: 0.2          # Geometry weight: jepa = (1-λ)*pred + λ*geom

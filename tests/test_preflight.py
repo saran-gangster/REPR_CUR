@@ -96,25 +96,16 @@ def test_sampler_horizon_distribution_matches_probs():
 
 
 # -----------------------------
-# 2) EMA update correctness
+# 2) EMA update correctness (REMOVED - Minimal JEPA has no EMA)
 # -----------------------------
 
+@pytest.mark.skip(reason="Minimal JEPA implementation does not use EMA teacher")
 def test_ema_update_moves_target_towards_online():
-    _set_seed(7)
-    jepa = JEPAObjective(d_model=32, latent_dim=32, horizons=[4], horizon_probs=[1.0])
-    jepa._init_target_from_online()
-    with torch.no_grad():
-        for p in jepa.online_proj.parameters():
-            p.add_(torch.randn_like(p) * 0.1)
-    old_target_params = [p.detach().clone() for p in jepa.target_proj.parameters()]
-    new_online_params = [p.detach().clone() for p in jepa.online_proj.parameters()]
-    m = 0.9
-    jepa.ema_momentum = m
-    jepa.momentum_update()
-    with torch.no_grad():
-        for t_param, old_t, new_o in zip(jepa.target_proj.parameters(), old_target_params, new_online_params):
-            expected = m * old_t + (1.0 - m) * new_o
-            assert torch.allclose(t_param, expected, rtol=1e-5, atol=1e-7)
+    """
+    This test is skipped because the minimal JEPA implementation
+    does not include an EMA teacher network.
+    """
+    pass
 
 
 # -----------------------------------------------
@@ -210,5 +201,60 @@ def test_bf16_mixed_precision_one_step_cuda():
             total_norm += g.norm().item()
             count += 1
     assert count > 0 and total_norm > 0.0, "No gradients were produced."
+
+
+# -----------------------------
+# 5) Minimal JEPA tests
+# -----------------------------
+
+def test_minimal_jepa_vicreg():
+    """Test minimal JEPA with VICReg regularizer"""
+    from src.utils.vicreg import vicreg_regularizer
+    _set_seed(42)
+    z = torch.randn(64, 128)
+    loss, metrics = vicreg_regularizer(z)
+    assert loss.ndim == 0, "Loss should be scalar"
+    assert loss.item() >= 0, "Loss should be non-negative"
+    assert "var_loss" in metrics
+    assert "cov_loss" in metrics
+    assert "mean_std" in metrics
+
+
+def test_minimal_jepa_sigreg():
+    """Test minimal JEPA with SIGReg regularizer"""
+    from src.utils.vicreg import sigreg_regularizer
+    _set_seed(42)
+    z = torch.randn(64, 128)
+    loss, metrics = sigreg_regularizer(z, num_directions=64)
+    assert loss.ndim == 0, "Loss should be scalar"
+    assert loss.item() >= 0, "Loss should be non-negative"
+    assert "moment2_loss" in metrics
+    assert "moment4_loss" in metrics
+    assert "mean_std" in metrics
+
+
+def test_minimal_jepa_forward():
+    """Test minimal JEPA forward pass"""
+    _set_seed(42)
+    B, T, C = 4, 128, 256
+    h = torch.randn(B, T, C)
+    
+    jepa = JEPAObjective(
+        d_model=C,
+        latent_dim=128,
+        horizons=[2, 8, 32],
+        horizon_probs=[0.5, 0.3, 0.2],
+        pairs_per_seq=16,
+        geometry_regularizer="vicreg",
+    )
+    
+    out = jepa(h)
+    
+    assert "loss" in out
+    assert "pred_loss" in out
+    assert "geom_loss" in out
+    assert out["loss"].ndim == 0
+    assert out["pred_loss"].ndim == 0
+    assert out["geom_loss"].ndim == 0
 
 

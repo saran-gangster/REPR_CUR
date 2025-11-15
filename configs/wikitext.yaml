@@ -1,3 +1,13 @@
+##################################################
+# Minimal LeJEPA config for WikiText-2
+# 
+# Core philosophy:
+# - Simple prediction loss (cosine)
+# - One geometric regularizer (VICReg)
+# - Total loss = lm_loss + α * jepa_loss
+#   where jepa_loss = (1-λ) * pred + λ * geom
+##################################################
+
 seed_everything: 52
 
 trainer:
@@ -6,6 +16,9 @@ trainer:
   check_val_every_n_epoch: 3
   gradient_clip_val: 1.0
   precision: bf16-mixed
+  accelerator: auto
+  devices: auto
+  strategy: auto
 
 model:
   vocab_size: 8192
@@ -16,49 +29,42 @@ model:
   ff_multiplier: 4
   use_rope: true
   rope_base: 10000
-  weight_tying: false
+  weight_tying: true
 
   jepa:
-    loss_type: soft_nce_psr
-
-    temperature: 0.15
-    teacher_kernel_temp: 0.25
-    neighbor_topk: 32
-    softnce_uncert_scale: 1.0
-
-    kappa_beta: 1.0
-    kappa_temp: 1.5
-
-    var_weight: 1.0
-    cycle_weight: 0.0
-    comp_weight: 0.0
-    pres_weight: 0.05
-
-    kl_future_weight: 0.1
-    kl_temp: 2.0
-    js_warmup_gamma: 2.0
-    freeze_lm_head_for_kl: true
-
+    # Core hyperparameters (only 2!)
+    alpha: 0.1                    # JEPA weight: total_loss = lm + α*jepa
+    geometry_lambda: 0.2          # Geometry weight: jepa = (1-λ)*pred + λ*geom
+    
+    # Architecture
     latent_dim: 512
+    predictor_hidden_multiplier: 2.0
+    
+    # Horizons
     horizons: [2, 8, 32, 64]
     horizon_probs: [0.4, 0.3, 0.2, 0.1]
-    pairs_per_seq: 32
-    ema_momentum: 0.996
-    ema_schedule: [0.99, 0.9999]
-
-    tap_layer: -4
+    pairs_per_seq: 64
+    
+    # Loss types
+    prediction_loss_type: cosine  # "cosine" or "l2"
+    geometry_regularizer: vicreg  # "vicreg" or "sigreg"
+    
+    # VICReg params (only used if geometry_regularizer=vicreg)
+    vicreg_var_weight: 1.0
+    vicreg_cov_weight: 0.1
+    
+    # SIGReg params (only used if geometry_regularizer=sigreg)
+    sigreg_num_directions: 128
+    
+    # Tap settings
+    tap_layer: -3
     tap_norm: true
-    grad_barrier: true
-
-    jepa_weight: 0.05
-    lm_weight: 0.8
-    lm_weight_use_scheduler: false
 
   optimizer:
     lr: 1.5e-4
     weight_decay: 0.1
     betas: [0.9, 0.95]
-    warmup_steps: 1500
+    warmup_steps: 1000
 
 data:
   module: wikitext2           

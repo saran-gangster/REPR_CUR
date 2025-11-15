@@ -2,11 +2,28 @@
 
 This repo trains a JEPA-augmented decoder-only transformer via LightningCLI. Use this as your quick map to the moving parts, how to run, and the house rules that matter here.
 
-## Big picture
-- Entry point: `src/train.py` wires `LitJEPA` + `UnifiedDataModule` into LightningCLI and injects both TensorBoard and W&B loggers by default.
-- Core model: `src/models/transformer.py` implements an autoregressive stack with RMSNorm, SwiGLU MLPs, and RoPE. Weight tying optionally exposes `logit_scale` and `output_bias`.
-- JEPA objective: `src/models/jepa.py` provides online/EMA towers, predictor, horizon embeddings, and VICReg-style regularizers. Tap features come from an intermediate transformer layer.
-- Utilities: `src/utils/{sampling.py,vicreg.py,ema.py}` contain horizon pair sampling, variance/covariance penalties, and EMA update helpers.
+## Current Implementation: Minimal LeJEPA
+
+**The minimal LeJEPA approach has replaced the original complex implementation as the default.**
+
+- Location: `src/models/jepa.py`, `src/lightning/lit_jepa.py`
+- Philosophy: Strip to essentials following LeJEPA paper principles
+- Core: Simple prediction loss + one geometric regularizer (VICReg or SIGReg)
+- Config: `configs/tiny_jepa.yaml`, `configs/wikitext.yaml`
+- Documentation: See `MINIMAL_LEJEPA.md` for full details
+- Backups: Original complex version saved as `*_backup.py` files
+
+### What Changed
+- **Removed**: EMA teacher, Soft-NCE, κ-modulation, cycle/composition losses, gradient barriers, complex scheduling
+- **Kept**: Simple prediction (cosine/L2) + geometry regularization (VICReg/SIGReg)
+- **Simplified**: From 20+ hyperparameters to 2 core knobs (α and λ)
+
+## Big picture (Current Minimal LeJEPA)
+- Entry point: `src/train.py` wires `LitJEPA` + `UnifiedDataModule` into LightningCLI
+- Core model: `src/models/transformer.py` implements an autoregressive stack with RMSNorm, SwiGLU MLPs, and RoPE
+- JEPA objective: `src/models/jepa.py` provides projector, predictor, horizon embeddings, and geometric regularizers
+- Geometric regularizers: `src/utils/vicreg.py` contains VICReg and SIGReg (isotropic Gaussian via random projections)
+- Utilities: `src/utils/sampling.py` handles horizon pair sampling
 
 ## Data and tokenization
 - Use `UnifiedDataModule` (`src/data/unified.py`) with `data.module` set to an alias or class path. Aliases resolve via `src/data/registry.py` (e.g., `tiny_shakespeare`, `wikitext2`, `wiki`, `wt2`, `tiny`).
@@ -19,22 +36,19 @@ This repo trains a JEPA-augmented decoder-only transformer via LightningCLI. Use
 - Precision/devices/strategy/grad-clip are controlled under the `trainer:` section in configs. Optional speed-ups: set `TORCH_COMPILE=1` (CUDA) and TF32 is auto-enabled when available.
 
 ## What the trainer does for you (`src/lightning/lit_jepa.py`)
-- JEPA tap and scheduling:
-	- Tap with `jepa.tap_layer` (negatives allowed); set `jepa.grad_barrier: true` to decouple grads below the tap; optional `jepa.tap_norm`.
-	- EMA momentum can cosine-ramp via `jepa.ema_schedule` + `jepa.ema_schedule_steps`; JEPA momentum is updated every train batch.
-	- `jepa.lm_weight` can warm up if `jepa.lm_weight_use_scheduler: true` (defaults on unless `run_baseline`).
+- Minimal loss combining: `total_loss = lm_loss + alpha * jepa_loss` where `jepa_loss = (1-lambda)*pred + lambda*geom`
+- JEPA tap: Tap with `jepa.tap_layer` (negatives allowed) to extract representations from intermediate layers
 - Optimizer grouping: heads (JEPA projector/predictor, horizon emb, LM head or tied token emb) get `lr_head`; backbone gets `lr`. Weight decay applies only to >=2D params. LR schedule = warmup+cosine per-step.
-- Gradient clipping is split at the tap: lower (token emb, blocks ≤ tap, norm_tap, JEPA heads) and upper (norm_f/lm_head) are clipped separately.
 - Auto vocab resize on `on_fit_start`: when the datamodule exposes `vocab_size`, token embedding and LM head are rebuilt and weight tying extras reinitialized.
 
 ## JEPA, horizons, and diagnostics
 - Pair sampling: `src/utils/sampling.py::sample_anchor_target_pairs` draws anchors/targets using `jepa.horizons`, `jepa.horizon_probs`, and `jepa.pairs_per_seq`.
-- Losses: JEPA combines alignment/Barlow-style terms; optional future LM KL (`kl_future_weight`) compares predicted-latent-derived logits to teacher next-token logits.
-- Validation logs: PPL, JEPA loss, alignment/Barlow metrics, std gap, retrieval Top‑1 and margin; validation pairs are cached per epoch for determinism.
+- Losses: JEPA combines prediction loss (cosine or L2) and geometric regularization (VICReg or SIGReg).
+- Validation logs: PPL, JEPA loss, prediction and geometry components, variance/covariance metrics; validation pairs are cached per epoch for determinism.
 
 ## Tests you should keep green
 - Run: `pytest -q tests/test_preflight.py`.
-- Covered invariants: horizon distribution, EMA update, RoPE causality/shape checks, and a CUDA BF16 forward/backward smoke test (auto-skips on non‑Ampere GPUs).
+- Covered invariants: horizon distribution, RoPE causality/shape checks, VICReg/SIGReg regularizers, minimal JEPA forward pass, and a CUDA BF16 forward/backward smoke test (auto-skips on non‑Ampere GPUs).
 
 ## Conventions and extension points
 - Treat YAML configs as source of truth; prefer adding knobs to configs rather than hardcoding.
@@ -68,4 +82,4 @@ Notes and pitfalls
 	- In validation, log `ce_future`, `teacher_entropy`, and `kl_future` (with T and T^2 scaling) using the same pairs as training.
 - Sanity checklist for KL path:
 	- Detach teacher logits; detach LM head (student side) or freeze it; use the same temperature on both sides; scale KL by T^2; warm up `kl_future_weight` if the head is unstable early.
-  
+

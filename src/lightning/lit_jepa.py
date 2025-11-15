@@ -1,15 +1,28 @@
+"""
+Minimal Lightning module for JEPA-augmented LM training.
+
+Simplified design following LeJEPA principles:
+- LM loss + α * JEPA loss (single scalar trade-off)
+- No gradient barrier (both losses backprop through entire network)
+- No complex scheduling or teacher coupling
+- Minimal logging for clarity
+"""
+
 from typing import Any, Dict
-import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import lightning as L
+
 from src.models.transformer import DecoderOnlyTransformer
 from src.models.jepa import JEPAObjective
 
+
 class WarmupCosineLR(optim.lr_scheduler._LRScheduler):
+    """Warmup + cosine decay learning rate schedule."""
+    
     def __init__(self, optimizer, warmup_steps: int, max_steps: int, last_epoch: int = -1):
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
@@ -24,7 +37,16 @@ class WarmupCosineLR(optim.lr_scheduler._LRScheduler):
             scale = 0.5 * (1.0 + math.cos(math.pi * progress))
         return [base_lr * scale for base_lr in self.base_lrs]
 
+
 class LitJEPA(L.LightningModule):
+    """
+    Minimal JEPA-augmented language model.
+    
+    Total loss: lm_loss + α * jepa_loss
+    
+    Where jepa_loss = (1 - λ) * prediction_loss + λ * geometry_loss
+    """
+    
     def __init__(
         self,
         vocab_size: int = 1000,
@@ -40,87 +62,58 @@ class LitJEPA(L.LightningModule):
         optimizer: Dict[str, Any] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['optimizer'])
-
+        self.save_hyperparameters()
+        
         jepa_cfg = jepa or {}
-
-        # Transformer
+        
+        # Transformer LM backbone
         self.model = DecoderOnlyTransformer(
-            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-            dropout=dropout, ff_multiplier=ff_multiplier, use_rope=use_rope, rope_base=rope_base,
+            vocab_size=vocab_size,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            ff_multiplier=ff_multiplier,
+            use_rope=use_rope,
+            rope_base=rope_base,
             weight_tying=weight_tying,
         )
-
-        # JEPA
+        
+        # Minimal JEPA objective
         self.jepa = JEPAObjective(
             d_model=d_model,
             latent_dim=jepa_cfg.get("latent_dim", d_model),
             predictor_hidden_multiplier=jepa_cfg.get("predictor_hidden_multiplier", 2.0),
-            horizons=jepa_cfg.get("horizons", [1, 2, 8, 32, 64]),
-            horizon_probs=jepa_cfg.get("horizon_probs", [0.5, 0.25, 0.15, 0.06, 0.04]),
+            horizons=jepa_cfg.get("horizons", [2, 8, 32, 64]),
+            horizon_probs=jepa_cfg.get("horizon_probs", [0.4, 0.3, 0.2, 0.1]),
             pairs_per_seq=jepa_cfg.get("pairs_per_seq", 64),
-            ema_momentum=jepa_cfg.get("ema_momentum", 0.996),
             dropout=dropout,
-            loss_type=jepa_cfg.get("loss_type", "soft_nce_psr"),
-            temperature=jepa_cfg.get("temperature", 0.15),
-            teacher_kernel_temp=jepa_cfg.get("teacher_kernel_temp", 0.25),
-            neighbor_topk=jepa_cfg.get("neighbor_topk", 32),
-            softnce_uncert_scale=jepa_cfg.get("softnce_uncert_scale", 1.0),
-            var_weight=jepa_cfg.get("var_weight", 1.0),
-            cov_weight=jepa_cfg.get("cov_weight", 0.0),
-            cycle_weight=jepa_cfg.get("cycle_weight", 0.10),
-            comp_weight=jepa_cfg.get("comp_weight", 0.05),
-            cycle_stop_grad=jepa_cfg.get("cycle_stop_grad", True),
-            pres_weight=jepa_cfg.get("pres_weight", 0.0),
-            kappa_beta=jepa_cfg.get("kappa_beta", 1.0),
-            kappa_temp=jepa_cfg.get("kappa_temp", 1.5),
-            normalize_latents=jepa_cfg.get("normalize_latents", True),
-            off_diag_scale=jepa_cfg.get("off_diag_scale", 0.01),
-            align_scale=jepa_cfg.get("align_scale", 1.0),
+            prediction_loss_type=jepa_cfg.get("prediction_loss_type", "cosine"),
+            geometry_regularizer=jepa_cfg.get("geometry_regularizer", "vicreg"),
+            geometry_lambda=jepa_cfg.get("geometry_lambda", 0.2),
+            vicreg_var_weight=jepa_cfg.get("vicreg_var_weight", 1.0),
+            vicreg_cov_weight=jepa_cfg.get("vicreg_cov_weight", 0.1),
+            sigreg_num_directions=jepa_cfg.get("sigreg_num_directions", 128),
         )
-
-        # JEPA/LM weights
-        self.jepa_weight = jepa_cfg.get("jepa_weight", jepa_cfg.get("lambda_weight", 0.1))
-        self.lm_weight_final = float(jepa_cfg.get("lm_weight", 1.0))
-        self.kl_temp = float(jepa_cfg.get("kl_temp", 2.0))
-        self.js_weight_max = float(jepa_cfg.get("kl_future_weight", 0.0))
-        self.js_warmup_gamma = float(jepa_cfg.get("js_warmup_gamma", 2.0))
-        self.kl_future_weight = self.js_weight_max
-        # KL/JS controls
-        self.freeze_lm_head_for_kl = bool(jepa_cfg.get("freeze_lm_head_for_kl", True))
-        self.kl_weight_warmup_steps = int(jepa_cfg.get("kl_weight_warmup_steps", 0))
-
-        # Baseline toggle (disables JEPA)
-        self.run_baseline = bool(jepa_cfg.get("run_baseline", False))
-        if self.run_baseline:
-            self.jepa_weight = 0.0
-            self.lm_weight_final = 1.0
-            self.js_weight_max = 0.0
-            self.kl_future_weight = 0.0
-
-        # LM weight scheduling
-        self.lm_weight_use_scheduler = bool(jepa_cfg.get("lm_weight_use_scheduler", not self.run_baseline))
-        self.lm_warmup_steps = int(jepa_cfg.get("lm_warmup_steps", 0))
-
-        # Gradient decoupling controls
-        self.jepa_tap_layer = jepa_cfg.get("tap_layer", -2)
-        self.jepa_grad_barrier = bool(jepa_cfg.get("grad_barrier", True))
+        
+        # JEPA weight (α)
+        self.alpha = float(jepa_cfg.get("alpha", 0.1))
+        
+        # Tap layer for JEPA
+        self.jepa_tap_layer = jepa_cfg.get("tap_layer", -3)
         self.jepa_tap_norm = bool(jepa_cfg.get("tap_norm", False))
-        # EMA schedule
-        ema_sched = jepa_cfg.get("ema_schedule", None)
-        if isinstance(ema_sched, (list, tuple)) and len(ema_sched) == 2:
-            self.ema_start, self.ema_end = float(ema_sched[0]), float(ema_sched[1])
-        else:
-            self.ema_start, self.ema_end = self.jepa.ema_momentum, self.jepa.ema_momentum
-        self.ema_sched_steps = int(jepa_cfg.get("ema_schedule_steps", self.lm_warmup_steps if self.lm_warmup_steps > 0 else 1))
-
-        # Optim config
-        self.optim_cfg = optimizer or {"lr": 3e-4, "weight_decay": 0.1, "betas": (0.9, 0.95), "warmup_steps": 200}
-    
+        
+        # Optimizer config
+        self.optim_cfg = optimizer or {
+            "lr": 3e-4,
+            "weight_decay": 0.1,
+            "betas": (0.9, 0.95),
+            "warmup_steps": 200,
+        }
+        
     def _lm_logits(self, h: torch.Tensor) -> torch.Tensor:
-        # Base logits
+        """Compute LM logits with weight tying if enabled."""
         logits = self.model.lm_head(h)
-        # If tied, apply learnable temperature and output bias
         if getattr(self.model, "weight_tying", False):
             ls = getattr(self.model, "logit_scale", None)
             if ls is not None:
@@ -129,489 +122,133 @@ class LitJEPA(L.LightningModule):
             if b is not None:
                 logits = logits + b
         return logits
-
-    def _student_logits_from_latent(self, h_latent: torch.Tensor) -> torch.Tensor:
-        """Compute student logits from latent->hidden mapping without updating LM head.
-
-        - Detaches LM head weights (and tied extras) so gradients flow only
-          through the latent_to_hidden mapper.
-        - Falls back to standard lm_head if freezing is disabled.
-        """
-        if not self.freeze_lm_head_for_kl:
-            return self._lm_logits(h_latent)
-
-        # Build logits with detached head weights/bias/scale
-        with torch.no_grad():
-            W = self.model.lm_head.weight.detach()
-            if getattr(self.model, "weight_tying", False):
-                bias_param = getattr(self.model, "output_bias", None)
-            else:
-                bias_param = getattr(self.model.lm_head, "bias", None)
-            b = bias_param.detach() if bias_param is not None else None
-            ls = getattr(self.model, "logit_scale", None)
-            if ls is not None:
-                ls_val = float(ls.detach())
-            else:
-                ls_val = 1.0
-
-        logits = torch.nn.functional.linear(h_latent, W, b)
-        if ls_val != 1.0:
-            logits = logits * ls_val
-        return logits
-
-    def _is_jepa_active(self) -> bool:
-        return self.jepa_weight > 0.0
-
-    def _zero(self) -> torch.Tensor:
-        return torch.zeros((), device=self.device)
-
-    def _scalar(self, value: float | int) -> torch.Tensor:
-        return torch.tensor(float(value), device=self.device)
-
-    def _forward_transformer(self, x: torch.Tensor, use_jepa: bool):
-        if use_jepa:
-            return self.model(
-                x,
-                tap_layer=self.jepa_tap_layer,
-                return_tap=True,
-                grad_barrier=self.jepa_grad_barrier,
-                tap_norm=self.jepa_tap_norm,
-            )
-
-        h_final = self.model(x, tap_layer=None, return_tap=False)
-        return (None, None), h_final
+    
+    def _forward_with_tap(self, x: torch.Tensor):
+        """Forward pass with tap for JEPA."""
+        return self.model(
+            x,
+            tap_layer=self.jepa_tap_layer,
+            return_tap=True,
+            grad_barrier=False,  # No gradient barrier
+            tap_norm=self.jepa_tap_norm,
+        )
     
     def forward(self, x):
-        return self.model(x)  # (B, T, C)
-
+        """Standard forward for inference."""
+        return self.model(x)
+    
     def _lm_loss(self, logits: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Compute language modeling loss."""
         targets = x[:, 1:]
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
-            targets.reshape(-1)
+            targets.reshape(-1),
         )
         return loss
-
-    def _current_lm_weight(self, step: int) -> float:
-        # If scheduler is disabled, use lm_weight as a constant from step 0
-        if not self.lm_weight_use_scheduler:
-            return max(0.0, float(self.lm_weight_final))
-
-        if self.lm_weight_final <= 0.0:
-            return 0.0
-        warm = max(0, self.lm_warmup_steps)
-        max_steps = self.trainer.max_steps or (warm + 1)
-        if step < warm:
-            return 0.0
-        frac = float(step - warm) / max(1, max_steps - warm)
-        frac = max(0.0, min(1.0, frac))
-        return float(self.lm_weight_final) * frac
-
-    def _current_js_weight(self, current_entropy: torch.Tensor, uniform_entropy: torch.Tensor) -> float:
-        if self.js_weight_max <= 0.0:
-            return 0.0
-
-        s = torch.clamp((uniform_entropy - current_entropy) / (uniform_entropy + 1e-8), 0.0, 1.0)
-        weight = self.js_weight_max * torch.pow(s, self.js_warmup_gamma)
-        if isinstance(weight, torch.Tensor):
-            return float(weight.item())
-        return float(weight)
-
-    def _current_kl_weight(self, step: int) -> float:
-        if self.kl_future_weight <= 0.0:
-            return 0.0
-        warm = max(0, self.kl_weight_warmup_steps)
-        if warm <= 0:
-            return float(self.kl_future_weight)
-        if step < warm:
-            return float(self.kl_future_weight) * (float(step) / max(1, warm))
-        return float(self.kl_future_weight)
-
-    def _current_ema_momentum(self, step: int) -> float:
-        if self.ema_sched_steps <= 0 or self.ema_start == self.ema_end:
-            return self.jepa.ema_momentum
-        t = max(0.0, min(1.0, float(step) / float(self.ema_sched_steps)))
-        alpha = 0.5 * (1.0 - math.cos(math.pi * t))  # cosine ramp 0->1
-        return self.ema_start + (self.ema_end - self.ema_start) * alpha
-
+    
     def training_step(self, batch, batch_idx):
-        x = batch  # (B,T)
-        use_jepa = self._is_jepa_active()
-        (h_pred, h_teacher), h_final = self._forward_transformer(x, use_jepa=use_jepa)
+        x = batch  # (B, T)
+        
+        # Forward with tap for JEPA
+        (h_tap, _), h_final = self._forward_with_tap(x)
+        
+        # LM loss
         logits_final = self._lm_logits(h_final)
-
         lm_logits = logits_final[:, :-1, :]
-        lm_loss = self._lm_loss(lm_logits, x) if self.lm_weight_final > 0.0 else self._zero()
-
-        js_future = self._zero()
-        teacher_entropy = self._zero()
-        eff_js_w = 0.0
-        if use_jepa:
-            return_latents = self.js_weight_max > 0.0
-            vocab_for_entropy = float(getattr(self.hparams, "vocab_size", self.model.lm_head.out_features))
-            uniform_entropy = torch.log(torch.tensor(vocab_for_entropy, device=self.device))
-
-            temp_pairs = self.jepa._sample_pairs(x.size(0), x.size(1), x.device)
-            b_idx, t_idx, tpos, k_ids = temp_pairs
-
-            logits_all = logits_final.detach()
-
-            teacher_logits_target = logits_all[b_idx, tpos, :]
-            teacher_logits_anchor = logits_all[b_idx, t_idx, :]
-
-            if getattr(self.model, "weight_tying", False):
-                bias_param = getattr(self.model, "output_bias", None)
-            else:
-                bias_param = getattr(self.model.lm_head, "bias", None)
-
-            detached_lm_head = (
-                self.model.lm_head.weight.detach(),
-                bias_param.detach() if bias_param is not None else None,
-            )
-
-            jepa_kwargs = {
-                "pairs": temp_pairs,
-                "teacher_h": h_teacher,
-                "return_latents": return_latents,
-                "teacher_logits_target": teacher_logits_target,
-                "teacher_logits_anchor": teacher_logits_anchor,
-                "detached_lm_head": detached_lm_head,
-            }
-
-            jepa_out = self.jepa(h_pred, **jepa_kwargs)
-            jepa_loss = jepa_out["loss"]
-
-            if return_latents:
-                z_pred = jepa_out.get("z_pred", None)
-                if z_pred is not None and z_pred.numel() > 0:
-                    Ttemp = float(self.kl_temp)
-                    log_p_teacher_T = F.log_softmax(teacher_logits_target / Ttemp, dim=-1)
-                    p_teacher_T = log_p_teacher_T.exp()
-
-                    h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
-                    student_logits = self._student_logits_from_latent(h_pred_vocab)
-                    log_q_student_T = F.log_softmax(student_logits / Ttemp, dim=-1)
-                    q_student_T = log_q_student_T.exp()
-
-                    m = 0.5 * (p_teacher_T + q_student_T)
-                    m_log = torch.log(m + 1e-8)
-
-                    kl_p_m = (p_teacher_T * (log_p_teacher_T - m_log)).sum(dim=-1).mean()
-                    kl_q_m = (q_student_T * (log_q_student_T - m_log)).sum(dim=-1).mean()
-                    js_future = 0.5 * (kl_p_m + kl_q_m)
-
-                    teacher_entropy_nograd = -(p_teacher_T * log_p_teacher_T).sum(dim=-1).mean().detach()
-                    teacher_entropy = teacher_entropy_nograd
-                    eff_js_w = self._current_js_weight(teacher_entropy_nograd, uniform_entropy)
-        else:
-            jepa_out = {}
-            jepa_loss = self._zero()
-
-        eff_lm_w = self._current_lm_weight(self.global_step)
-        total_loss = eff_lm_w * lm_loss + self.jepa_weight * jepa_loss
-        if eff_js_w > 0.0 and use_jepa:
-            total_loss = total_loss + eff_js_w * js_future
-
+        lm_loss = self._lm_loss(lm_logits, x)
+        
+        # JEPA loss
+        jepa_out = self.jepa(h_tap)
+        jepa_loss = jepa_out["loss"]
+        
+        # Total loss
+        total_loss = lm_loss + self.alpha * jepa_loss
+        
+        # Logging
         self.log("train/lm_loss", lm_loss, on_step=True)
+        self.log("train/jepa_loss", jepa_loss, on_step=True)
+        self.log("train/pred_loss", jepa_out["pred_loss"], on_step=True)
+        self.log("train/geom_loss", jepa_out["geom_loss"], on_step=True)
         self.log("train/total_loss", total_loss, on_step=True)
-
-        metric_names = [
-            "align_loss",
-            "psc_loss",
-            "var_loss",
-            "cov_loss",
-            "cycle_loss",
-            "comp_loss",
-            "pres_loss",
-            "nce_pos",
-            "nce_margin",
-            "std_anchor",
-            "std_pred",
-        ]
-
-        if use_jepa:
-            self.log("train/jepa_loss", jepa_out["loss"], on_step=True)
-            for name in metric_names:
-                self.log(f"train/{name}", jepa_out.get(name, self._zero()), on_step=True)
-            if "barlow_on_diag" in jepa_out:
-                self.log("train/barlow_on_diag", jepa_out["barlow_on_diag"], on_step=True)
-            if "barlow_off_diag" in jepa_out:
-                self.log("train/barlow_off_diag", jepa_out["barlow_off_diag"], on_step=True)
-            std_anchor = jepa_out.get("std_anchor", self._zero())
-            std_pred = jepa_out.get("std_pred", self._zero())
-            self.log("train/std_gap", std_pred - std_anchor, on_step=True)
-            self.log("train/js_future", js_future, on_step=True)
-            self.log("train/teacher_entropy", teacher_entropy, on_step=True)
-            self.log("train/js_future_weight_eff", self._scalar(eff_js_w), on_step=True)
-        else:
-            zero = self._zero()
-            self.log("train/jepa_loss", zero, on_step=True)
-            for name in metric_names:
-                self.log(f"train/{name}", zero, on_step=True)
-            self.log("train/barlow_on_diag", zero, on_step=True)
-            self.log("train/barlow_off_diag", zero, on_step=True)
-            self.log("train/std_gap", zero, on_step=True)
-            self.log("train/teacher_entropy", zero, on_step=True)
-            self.log("train/js_future", zero, on_step=True)
-            self.log("train/js_future_weight_eff", zero, on_step=True)
-
+        
+        # Geometry metrics
+        if "geom_mean_std" in jepa_out:
+            self.log("train/geom_mean_std", jepa_out["geom_mean_std"], on_step=True)
+        if "geom_var_loss" in jepa_out:
+            self.log("train/geom_var_loss", jepa_out["geom_var_loss"], on_step=True)
+        if "geom_cov_loss" in jepa_out:
+            self.log("train/geom_cov_loss", jepa_out["geom_cov_loss"], on_step=True)
+        if "geom_moment2_loss" in jepa_out:
+            self.log("train/geom_moment2_loss", jepa_out["geom_moment2_loss"], on_step=True)
+        if "geom_moment4_loss" in jepa_out:
+            self.log("train/geom_moment4_loss", jepa_out["geom_moment4_loss"], on_step=True)
+        
         return total_loss
     
     def on_validation_epoch_start(self):
+        """Cache validation pairs for deterministic validation."""
         pass
     
     def _get_or_make_val_pairs(self, B: int, T: int, device: torch.device):
+        """Get or create cached validation pairs."""
         pairs = getattr(self, "_val_pairs", None)
         if pairs is not None:
             b_idx, t_idx, tpos, _ = pairs
-            shape_ok = (b_idx.numel() == self.jepa.pairs_per_seq * B) and (t_idx.max().item() < T) and (tpos.max().item() < T)
-            device_ok = (b_idx.device == device)
+            shape_ok = (
+                b_idx.numel() == self.jepa.pairs_per_seq * B
+                and t_idx.max().item() < T
+                and tpos.max().item() < T
+            )
+            device_ok = b_idx.device == device
             if shape_ok and device_ok:
                 return pairs
-
+        
+        # Create new cached pairs
         g = torch.Generator(device=device)
         g.manual_seed(12345)
         self._val_pairs = self.jepa._sample_pairs(B, T, device, generator=g)
         return self._val_pairs
-
-    def _validation_jepa_eval(
-        self,
-        h_pred: torch.Tensor,
-        h_teacher: torch.Tensor | None,
-        logits_final: torch.Tensor,
-        pairs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    ):
-        zero = self._zero()
-
-        with torch.no_grad():
-            logits_all = logits_final.detach()
-            b_idx, t_idx, tpos, _ = pairs
-            teacher_logits_target = logits_all[b_idx, tpos, :]
-            teacher_logits_anchor = logits_all[b_idx, t_idx, :]
-            if getattr(self.model, "weight_tying", False):
-                bias_param = getattr(self.model, "output_bias", None)
-            else:
-                bias_param = getattr(self.model.lm_head, "bias", None)
-            detached_lm_head = (
-                self.model.lm_head.weight.detach(),
-                bias_param.detach() if bias_param is not None else None,
-            )
-
-        jepa_out = self.jepa(
-            h_pred,
-            pairs=pairs,
-            teacher_h=h_teacher,
-            teacher_logits_target=teacher_logits_target,
-            teacher_logits_anchor=teacher_logits_anchor,
-            detached_lm_head=detached_lm_head,
-        )
-
-        metrics = {
-            "align_loss": jepa_out.get("align_loss", zero),
-            "psc_loss": jepa_out.get("psc_loss", zero),
-            "var_loss": jepa_out.get("var_loss", zero),
-            "cov_loss": jepa_out.get("cov_loss", zero),
-            "cycle_loss": jepa_out.get("cycle_loss", zero),
-            "comp_loss": jepa_out.get("comp_loss", zero),
-            "pres_loss": jepa_out.get("pres_loss", zero),
-            "nce_pos": jepa_out.get("nce_pos", zero),
-            "nce_margin": jepa_out.get("nce_margin", zero),
-            "std_anchor": jepa_out.get("std_anchor", zero),
-            "std_pred": jepa_out.get("std_pred", zero),
-            "std_gap": jepa_out.get("std_pred", zero) - jepa_out.get("std_anchor", zero),
-            "pair_count": self._scalar(float(pairs[0].numel())),
-        }
-        if "barlow_on_diag" in jepa_out:
-            metrics["barlow_on_diag"] = jepa_out["barlow_on_diag"]
-        if "barlow_off_diag" in jepa_out:
-            metrics["barlow_off_diag"] = jepa_out["barlow_off_diag"]
-
-        return jepa_out, jepa_out.get("loss", zero), metrics, teacher_logits_target
-
-    @torch.no_grad()
-    def _validation_retrieval_eval(
-        self,
-        z_pred: torch.Tensor,
-        z_tgt: torch.Tensor,
-        k_ids: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Compute retrieval-style diagnostics (Top-1 accuracy, margin)."""
-        if z_pred.numel() == 0:
-            zero = self._zero()
-            return {"top1_acc": zero, "margin": zero}
-
-        p = F.normalize(z_pred, dim=-1)
-        y = F.normalize(z_tgt, dim=-1)
-
-        unique_hids = torch.unique(k_ids)
-        total_n = 0
-        correct_sum = 0.0
-        dtrue_sum = 0.0
-        dneg_sum = 0.0
-
-        for hid in unique_hids:
-            horizon_idx = (k_ids == hid).nonzero(as_tuple=True)[0]
-            n_h = int(horizon_idx.numel())
-            if n_h < 2:
-                continue
-
-            p_h, y_h = p[horizon_idx], y[horizon_idx]
-            sim = p_h @ y_h.T
-            pos_sim = sim.diag()
-
-            sim_neg = sim.clone()
-            sim_neg.fill_diagonal_(-float("inf"))
-            max_neg_sim, _ = sim_neg.max(dim=1)
-
-            correct_sum += (pos_sim > max_neg_sim).float().sum().item()
-            dtrue_sum += (1.0 - pos_sim).sum().item()
-            dneg_sum += (1.0 - max_neg_sim).sum().item()
-            total_n += n_h
-
-        if total_n > 0:
-            top1_acc = self._scalar(correct_sum / total_n)
-            margin = self._scalar((dneg_sum / total_n) - (dtrue_sum / total_n))
-        else:
-            top1_acc = self._zero()
-            margin = self._zero()
-
-        return {"top1_acc": top1_acc, "margin": margin}
     
+    @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         x = batch
-        B, T = x.shape[:2]
-        use_jepa = self._is_jepa_active()
-
-        zero = self._zero()
-
-        with torch.no_grad():
-            (h_pred, h_teacher), h_final = self._forward_transformer(x, use_jepa=use_jepa)
-            logits_final = self._lm_logits(h_final)
-            lm_logits = logits_final[:, :-1, :]
-            lm_loss = self._lm_loss(lm_logits, x) if self.lm_weight_final > 0.0 else self._zero()
-
-            js_future = zero
-            teacher_H = zero
-            if use_jepa:
-                val_pairs = self._get_or_make_val_pairs(B, T, x.device)
-                jepa_out, jepa_loss, metrics, teacher_logits_target = self._validation_jepa_eval(
-                    h_pred,
-                    h_teacher,
-                    logits_final,
-                    val_pairs,
-                )
-
-                z_pred, z_tgt, k_ids = self.jepa.compute_latents(h_pred, pairs=val_pairs, teacher_h=h_teacher)
-                metrics.update(self._validation_retrieval_eval(z_pred, z_tgt, k_ids))
-
-                if self.js_weight_max > 0.0 and z_pred.numel() > 0:
-                    Ttemp = float(self.kl_temp)
-                    log_p_teacher_T = F.log_softmax(teacher_logits_target / Ttemp, dim=-1)
-                    p_teacher_T = log_p_teacher_T.exp()
-
-                    h_pred_vocab = self.jepa.latent_to_hidden(z_pred)
-                    student_logits = self._student_logits_from_latent(h_pred_vocab)
-                    log_q_student_T = F.log_softmax(student_logits / Ttemp, dim=-1)
-                    q_student_T = log_q_student_T.exp()
-
-                    m = 0.5 * (p_teacher_T + q_student_T)
-                    m_log = torch.log(m + 1e-8)
-
-                    kl_p_m = (p_teacher_T * (log_p_teacher_T - m_log)).sum(dim=-1).mean()
-                    kl_q_m = (q_student_T * (log_q_student_T - m_log)).sum(dim=-1).mean()
-                    js_future = 0.5 * (kl_p_m + kl_q_m)
-                    teacher_H = -(p_teacher_T * log_p_teacher_T).sum(dim=-1).mean()
-
-                metrics["js_future"] = js_future
-                metrics["teacher_entropy"] = teacher_H
-            else:
-                jepa_out, jepa_loss = {}, zero
-                metrics = {
-                    "align_loss": zero,
-                    "psc_loss": zero,
-                    "var_loss": zero,
-                    "cov_loss": zero,
-                    "cycle_loss": zero,
-                    "comp_loss": zero,
-                    "pres_loss": zero,
-                    "nce_pos": zero,
-                    "nce_margin": zero,
-                    "std_anchor": zero,
-                    "std_pred": zero,
-                    "std_gap": zero,
-                    "pair_count": zero,
-                    "top1_acc": zero,
-                    "margin": zero,
-                    "js_future": zero,
-                    "teacher_entropy": zero,
-                    "barlow_on_diag": zero,
-                    "barlow_off_diag": zero,
-                }
-
-        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True)
-
-        metric_names = [
-            "align_loss",
-            "psc_loss",
-            "var_loss",
-            "cov_loss",
-            "cycle_loss",
-            "comp_loss",
-            "pres_loss",
-            "nce_pos",
-            "nce_margin",
-            "std_anchor",
-            "std_pred",
-            "std_gap",
-            "pair_count",
-            "top1_acc",
-            "margin",
-            "js_future",
-            "teacher_entropy",
-        ]
-
-        for name in metric_names:
-            value = metrics.get(name, zero)
-            prog_bar = name in ("align_loss", "top1_acc")
-            self.log(f"val/{name}", value, on_epoch=True, sync_dist=True, prog_bar=prog_bar)
-
-        if "barlow_on_diag" in metrics:
-            self.log("val/barlow_on_diag", metrics["barlow_on_diag"], on_epoch=True, sync_dist=True)
-        if "barlow_off_diag" in metrics:
-            self.log("val/barlow_off_diag", metrics["barlow_off_diag"], on_epoch=True, sync_dist=True)
-
-        self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True)
+        B, T = x.shape
         
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        # Only update EMA if JEPA is active
-        if self._is_jepa_active():
-            try:
-                self.jepa.ema_momentum = float(self._current_ema_momentum(self.global_step))
-                self.log("train/ema_momentum", self._scalar(self.jepa.ema_momentum), on_step=True)
-            except Exception:
-                pass
-            self.jepa.momentum_update()
-
+        # Forward with tap
+        (h_tap, _), h_final = self._forward_with_tap(x)
+        
+        # LM loss
+        logits_final = self._lm_logits(h_final)
+        lm_logits = logits_final[:, :-1, :]
+        lm_loss = self._lm_loss(lm_logits, x)
+        
+        # JEPA loss with cached pairs
+        val_pairs = self._get_or_make_val_pairs(B, T, x.device)
+        jepa_out = self.jepa(h_tap, pairs=val_pairs)
+        jepa_loss = jepa_out["loss"]
+        
+        # Logging
+        self.log("val/ppl", torch.exp(lm_loss), on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("val/lm_loss", lm_loss, on_epoch=True, sync_dist=True)
+        self.log("val/jepa_loss", jepa_loss, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("val/pred_loss", jepa_out["pred_loss"], on_epoch=True, sync_dist=True)
+        self.log("val/geom_loss", jepa_out["geom_loss"], on_epoch=True, sync_dist=True)
+        
+        # Geometry metrics
+        if "geom_mean_std" in jepa_out:
+            self.log("val/geom_mean_std", jepa_out["geom_mean_std"], on_epoch=True, sync_dist=True)
+        if "geom_var_loss" in jepa_out:
+            self.log("val/geom_var_loss", jepa_out["geom_var_loss"], on_epoch=True, sync_dist=True)
+        if "geom_cov_loss" in jepa_out:
+            self.log("val/geom_cov_loss", jepa_out["geom_cov_loss"], on_epoch=True, sync_dist=True)
+        if "geom_moment2_loss" in jepa_out:
+            self.log("val/geom_moment2_loss", jepa_out["geom_moment2_loss"], on_epoch=True, sync_dist=True)
+        if "geom_moment4_loss" in jepa_out:
+            self.log("val/geom_moment4_loss", jepa_out["geom_moment4_loss"], on_epoch=True, sync_dist=True)
+    
     def on_fit_start(self):
-        # Freeze unused modules to avoid DDP unused-param errors
-        try:
-            if self.lm_weight_final <= 0.0:
-                for p in self.model.lm_head.parameters():
-                    p.requires_grad = False
-
-            if self.jepa_weight <= 0.0:
-                for p in self.jepa.parameters():
-                    p.requires_grad = False
-                for p in self.model.norm_tap.parameters():
-                    p.requires_grad = False
-            else:
-                if not self.jepa_tap_norm and hasattr(self.model, "norm_tap"):
-                    for p in self.model.norm_tap.parameters():
-                        p.requires_grad = False
-        except Exception:
-            pass
-
-        # Match vocab to datamodule automatically (BPE)
+        """Setup at training start."""
+        # Match vocab to datamodule if needed
         try:
             dm = self.trainer.datamodule
             if dm is not None and getattr(dm, "vocab_size", None):
@@ -620,18 +257,18 @@ class LitJEPA(L.LightningModule):
                 if new_V != old_V:
                     d_model = self.model.token_emb.embedding_dim
                     device = self.device
-
+                    
                     # Recreate token embedding
                     tok = nn.Embedding(new_V, d_model).to(device)
                     self.model.token_emb = tok
-
-                    # Recreate LM head and tie as needed
+                    
+                    # Recreate LM head
                     head = nn.Linear(d_model, new_V, bias=False).to(device)
                     if getattr(self.model, "weight_tying", False):
                         head.weight = self.model.token_emb.weight
                     self.model.lm_head = head
-
-                    # Rebuild tied softmax extras
+                    
+                    # Rebuild tied extras
                     if getattr(self.model, "weight_tying", False):
                         scale_init = float(getattr(self.model, "logit_scale_init", 1.0))
                         self.model.logit_scale = nn.Parameter(torch.tensor(scale_init, device=device))
@@ -639,29 +276,12 @@ class LitJEPA(L.LightningModule):
                     else:
                         self.model.logit_scale = None
                         self.model.output_bias = None
-
-                    self.hparams.vocab_size = new_V
                     
+                    self.hparams.vocab_size = new_V
         except Exception:
             pass
-
-        # Ensure EMA schedule length sane
-        try:
-            if getattr(self, "ema_sched_steps", None) in (None, 0, 1):
-                try:
-                    self.ema_sched_steps = int(self.trainer.max_steps or 1000)
-                except Exception:
-                    self.ema_sched_steps = 1000
-        except Exception:
-            self.ema_sched_steps = 1000
-
-        # Initialize EMA to schedule start
-        try:
-            self.jepa.ema_momentum = float(self._current_ema_momentum(0))
-        except Exception:
-            pass
-
-        # Enable TF32 where available
+        
+        # Enable TF32 for speed
         if torch.cuda.is_available():
             try:
                 torch.set_float32_matmul_precision("high")
@@ -669,103 +289,55 @@ class LitJEPA(L.LightningModule):
                 pass
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-
-        # If WandbLogger is active, watch the model
+        
+        # W&B model watching
         try:
             from lightning.pytorch.loggers import WandbLogger
             from lightning.pytorch.loggers.logger import LoggerCollection
+            logger = self.logger
+            if isinstance(logger, LoggerCollection):
+                for lg in logger:
+                    if isinstance(lg, WandbLogger):
+                        lg.watch(self, log="gradients", log_freq=200)
+            elif isinstance(logger, WandbLogger):
+                logger.watch(self, log="gradients", log_freq=200)
         except Exception:
-            return
-        logger = self.logger
-        if isinstance(logger, LoggerCollection):
-            for lg in logger:
-                if isinstance(lg, WandbLogger):
-                    lg.watch(self, log="gradients", log_freq=200)
-        elif isinstance(logger, WandbLogger):
-            logger.watch(self, log="gradients", log_freq=200)
-            
-    def setup(self, stage: str):
-        # Optional compilation for extra speed on CUDA: export TORCH_COMPILE=1
-        if hasattr(torch, "compile") and os.getenv("TORCH_COMPILE", "0") == "1":
-            if torch.cuda.is_available():
-                mode = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
-                try:
-                    self.model = torch.compile(self.model, mode=mode)
-                except Exception:
-                    pass
-
+            pass
+    
     def configure_optimizers(self):
+        """Setup optimizer and scheduler."""
         wd = self.optim_cfg.get("weight_decay", 0.1)
         betas = self.optim_cfg.get("betas", (0.9, 0.95))
         lr = self.optim_cfg.get("lr", 3e-4)
         warmup = self.optim_cfg.get("warmup_steps", 200)
-
-        head_params: list[torch.nn.Parameter] = []
-        head_ids: set[int] = set()
-
-        def add_head_params(params):
-            for p in params:
-                if p is None or not p.requires_grad:
-                    continue
-                head_params.append(p)
-                head_ids.add(id(p))
-
-        # JEPA heads
-        add_head_params(self.jepa.online_proj.parameters())
-        add_head_params(self.jepa.predictor.parameters())
-        add_head_params(self.jepa.horizon_emb_latent.parameters())
-        add_head_params(self.jepa.latent_to_hidden.parameters())
-
-        if self.model.weight_tying:
-            add_head_params(self.model.token_emb.parameters())
-            add_head_params([getattr(self.model, "logit_scale", None)])
-            add_head_params([getattr(self.model, "output_bias", None)])
-        else:
-            add_head_params(self.model.lm_head.parameters())
-
-        backbone_params = [
-            p for p in self.parameters()
-            if p is not None and p.requires_grad and id(p) not in head_ids
-        ]
-
-        def split_decay(params):
-            decay, no_decay = [], []
-            for p in params:
+        
+        # Separate parameters by weight decay
+        decay_params = []
+        no_decay_params = []
+        
+        for p in self.parameters():
+            if p.requires_grad:
                 if p.ndim < 2:
-                    no_decay.append(p)
+                    no_decay_params.append(p)
                 else:
-                    decay.append(p)
-            return decay, no_decay
-
-        head_decay, head_no_decay = split_decay(head_params)
-        bb_decay, bb_no_decay = split_decay(backbone_params)
-
-        param_groups = []
-        if head_decay or head_no_decay:
-            param_groups.append({
-                "params": head_decay + head_no_decay,
-                "lr": lr,
-                "weight_decay": 0.0,
-            })
-        if bb_decay:
-            param_groups.append({
-                "params": bb_decay,
-                "lr": lr,
-                "weight_decay": wd,
-            })
-        if bb_no_decay:
-            param_groups.append({
-                "params": bb_no_decay,
-                "lr": lr,
-                "weight_decay": 0.0,
-            })
-
+                    decay_params.append(p)
+        
+        param_groups = [
+            {"params": decay_params, "lr": lr, "weight_decay": wd},
+            {"params": no_decay_params, "lr": lr, "weight_decay": 0.0},
+        ]
+        
         optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=betas)
-
+        
         if self.trainer.max_steps is None:
             return optimizer
-
-        scheduler = WarmupCosineLR(optimizer, warmup_steps=warmup, max_steps=self.trainer.max_steps)
+        
+        scheduler = WarmupCosineLR(
+            optimizer,
+            warmup_steps=warmup,
+            max_steps=self.trainer.max_steps,
+        )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -773,80 +345,3 @@ class LitJEPA(L.LightningModule):
                 "interval": "step",
             },
         }
-            
-    # Per-branch gradient clipping; compatible with Lightning variants (with or without optimizer_idx arg)
-    def configure_gradient_clipping(
-        self,
-        optimizer,
-        optimizer_idx: int | None = None,
-        gradient_clip_val: float | None = None,
-        gradient_clip_algorithm: str | None = None,
-        *args,
-        **kwargs,
-    ):
-        if optimizer_idx is not None and isinstance(optimizer_idx, (float, int)) and gradient_clip_val is None:
-            gradient_clip_val = float(optimizer_idx)
-            optimizer_idx = None
-            gradient_clip_algorithm = kwargs.get("gradient_clip_algorithm", gradient_clip_algorithm)
-
-        try:
-            clip_val = float(gradient_clip_val) if gradient_clip_val is not None else 0.0
-        except Exception:
-            clip_val = 0.0
-        if clip_val is None or clip_val <= 0.0:
-            return
-
-        try:
-            n_layers = getattr(self.model, "n_layers", None)
-            tap_layer = self.jepa_tap_layer
-            if n_layers is None or tap_layer is None:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=clip_val)
-                return
-            tap_idx = tap_layer if tap_layer >= 0 else n_layers + tap_layer
-            tap_idx = max(0, min(n_layers - 1, tap_idx))
-
-            lower_params = []
-            upper_params = []
-
-            # Lower: token_emb + blocks[0..tap_idx] + norm_tap + JEPA heads
-            lower_params += list(self.model.token_emb.parameters())
-            for i, blk in enumerate(self.model.blocks):
-                if i <= tap_idx:
-                    lower_params += list(blk.parameters())
-                else:
-                    upper_params += list(blk.parameters())
-            lower_params += list(self.model.norm_tap.parameters())
-
-            # Upper: LM-only modules
-            upper_params += list(self.model.norm_f.parameters())
-            upper_params += list(self.model.lm_head.parameters())
-
-            # JEPA (lower)
-            lower_params += list(self.jepa.online_proj.parameters())
-            lower_params += list(self.jepa.predictor.parameters())
-            lower_params += list(self.jepa.horizon_emb_latent.parameters())
-            # target_proj is EMA/no-grad
-
-            def uniq(params):
-                seen = set()
-                out = []
-                for p in params:
-                    if p is None:
-                        continue
-                    pid = id(p)
-                    if pid not in seen:
-                        seen.add(pid)
-                        out.append(p)
-                return out
-
-            lower_params = uniq(lower_params)
-            upper_params = uniq(upper_params)
-
-            torch.nn.utils.clip_grad_norm_(lower_params, max_norm=clip_val, norm_type=2.0)
-            torch.nn.utils.clip_grad_norm_(upper_params, max_norm=clip_val, norm_type=2.0)
-
-        except Exception:
-            try:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=clip_val, norm_type=2.0)
-            except Exception:
-                pass

@@ -4,8 +4,12 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Documentations
+*.md
+README.md
 # Log directories
 lightning_logs/
+backup/
 
 # IDE / Editor specific files
 .vscode/

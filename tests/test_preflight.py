@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import numpy as np
 import torch
 import pytest
@@ -256,5 +257,48 @@ def test_minimal_jepa_forward():
     assert out["loss"].ndim == 0
     assert out["pred_loss"].ndim == 0
     assert out["geom_loss"].ndim == 0
+
+
+def _eval_lm_loss_only(model: LitJEPA, tokens: torch.Tensor) -> float:
+    model.eval()
+    with torch.no_grad():
+        h_final = model.model(tokens)
+        logits = model._lm_logits(h_final)[:, :-1, :]
+        loss = model._lm_loss(logits, tokens)
+        return float(loss)
+
+
+def test_weight_tying_auto_logit_scale_stabilizes_loss():
+    _set_seed(7)
+    vocab_size = 512
+    d_model = 128
+    batch = torch.randint(0, vocab_size, (4, 64))
+
+    baseline = LitJEPA(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=2,
+        n_heads=4,
+        weight_tying=False,
+        jepa={"run_baseline": True},
+    )
+    tied = LitJEPA(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=2,
+        n_heads=4,
+        weight_tying=True,
+        jepa={"run_baseline": True},
+    )
+
+    auto_scale = 1.0 / math.sqrt(d_model)
+    assert math.isclose(tied.model.logit_scale_init, auto_scale, rel_tol=1e-5)
+    assert math.isclose(tied.model.embedding_init_std, 1.0 / math.sqrt(d_model), rel_tol=1e-6)
+
+    base_loss = _eval_lm_loss_only(baseline, batch)
+    tied_loss = _eval_lm_loss_only(tied, batch)
+
+    # Tied model should now have a finite, non-exploding loss close to untied baseline
+    assert tied_loss <= base_loss * 1.2
 
 

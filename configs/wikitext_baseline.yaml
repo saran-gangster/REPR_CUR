@@ -63,5 +63,6 @@ data:
   batch_size: 64
   num_workers: 4
   train_fraction: 1.0
+  subset_seed: 42
   bpe_vocab_size: 8192
-  force_rebuild_tokenizer: false
+  bpe_lowercase: true

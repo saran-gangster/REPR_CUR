@@ -289,7 +289,10 @@ class LitJEPA(L.LightningModule):
                     
                     # Recreate token embedding
                     tok = nn.Embedding(new_V, d_model).to(device)
+                    emb_std = getattr(self.model, "embedding_init_std", 1.0 / math.sqrt(d_model))
+                    nn.init.normal_(tok.weight, mean=0.0, std=emb_std)
                     self.model.token_emb = tok
+                    self.model.embedding_init_std = emb_std
                     
                     # Recreate LM head
                     head = nn.Linear(d_model, new_V, bias=False).to(device)

@@ -70,8 +70,8 @@ model:
     warmup_steps: 1000
 
 data:
-  module: wikitext2           
-  data_dir: data/wikitext2/
+  module: wikitext2
+  data_dir: data/
   block_size: 512
   batch_size: 16
   num_workers: 4

@@ -98,7 +98,8 @@ class DecoderOnlyTransformer(nn.Module):
         use_rope: bool = True,
         rope_base: float = 10000.0,
         weight_tying: bool = False,
-        logit_scale_init: float = 1.0,
+        logit_scale_init: Optional[float] = None,
+        embedding_init_std: Optional[float] = None,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -111,7 +112,20 @@ class DecoderOnlyTransformer(nn.Module):
         self.n_layers = n_layers
 
         self.weight_tying = bool(weight_tying)
-        self.logit_scale_init = float(logit_scale_init)
+        default_emb_std = 1.0 / math.sqrt(d_model)
+        self.embedding_init_std = (
+            float(default_emb_std) if embedding_init_std is None else float(embedding_init_std)
+        )
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=self.embedding_init_std)
+
+        if self.weight_tying:
+            # Keep tied output logits in a sane range by defaulting to 1/sqrt(d_model)
+            default_scale = 1.0 / math.sqrt(d_model)
+            scale_value = default_scale if logit_scale_init is None else float(logit_scale_init)
+        else:
+            scale_value = float(logit_scale_init) if logit_scale_init is not None else 1.0
+
+        self.logit_scale_init = float(scale_value)
 
 
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)

@@ -1,0 +1,74 @@
+##################################################
+# Weak JEPA prediction-only ablation for WikiText-2
+#
+# Goal:
+# - Keep LM architecture identical to the main JEPA runs
+# - Turn off geometry regularization (λ = 0)
+# - Down-weight JEPA loss (α = 0.01) to probe whether
+#   prediction-only JEPA still harms LM perplexity
+#
+# Run via:
+#   python -m src.train fit --config configs/wikitext_predonly.yaml
+##################################################
+
+seed_everything: 52
+
+trainer:
+  max_steps: 10000
+  log_every_n_steps: 50
+  check_val_every_n_epoch: 3
+  gradient_clip_val: 1.0
+  precision: bf16-mixed
+  accelerator: auto
+  devices: auto
+  strategy: auto
+
+model:
+  vocab_size: 8192
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.1
+  ff_multiplier: 4
+  use_rope: true
+  rope_base: 10000
+  weight_tying: true
+
+  jepa:
+    run_baseline: false
+    alpha: 0.01                 # Total loss = lm + 0.01 * jepa
+    geometry_lambda: 0.0        # JEPA loss reduces to prediction-only
+
+    latent_dim: 512
+    predictor_hidden_multiplier: 2.0
+
+    horizons: [2, 8, 32, 64]
+    horizon_probs: [0.4, 0.3, 0.2, 0.1]
+    pairs_per_seq: 64
+
+    prediction_loss_type: cosine
+    geometry_regularizer: vicreg # Ignored because geometry_lambda = 0
+
+    vicreg_var_weight: 1.0
+    vicreg_cov_weight: 0.1
+    sigreg_num_directions: 128
+
+    tap_layer: -3
+    tap_norm: true
+
+  optimizer:
+    lr: 1.5e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+    warmup_steps: 1000
+
+data:
+  module: wikitext2
+  data_dir: data/
+  block_size: 512
+  batch_size: 16
+  num_workers: 4
+  train_fraction: 1.0
+  subset_seed: 1234
+  bpe_vocab_size: 8192
+  bpe_lowercase: true
